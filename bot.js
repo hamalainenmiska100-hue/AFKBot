@@ -1,3 +1,8 @@
+/**
+ * BEDROCK AFK BOT - PRODUCTION VERSION
+ * Optimointi: Korkea virheensieto, RAM-hallinta ja vakaus.
+ */
+
 const {
   Client,
   GatewayIntentBits,
@@ -19,88 +24,115 @@ const fs = require("fs");
 const path = require("path");
 
 // ----------------------------------------------------------------
-// CONFIGURATION & CONSTANTS
+// KONFIGURAATIO JA VAKIOT
 // ----------------------------------------------------------------
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const ALLOWED_GUILD_ID = "1462335230345089254";
 const ADMIN_ID = "1144987924123881564";
 const LOG_CHANNEL_ID = "1464615030111731753";
 const ADMIN_CHANNEL_ID = "1464615993320935447";
-const CONNECTION_TIMEOUT = 25000; // 25 seconds
+
+// Optimoitu timeoutit ja rajoitukset
+const CONNECTION_TIMEOUT_MS = 25000; 
+const MAX_RECONNECT_ATTEMPTS = 10;
+const AUTH_PROCESS_TIMEOUT_MS = 300000; // 5 minuuttia kirjautumiseen
+const RAM_CRITICAL_THRESHOLD_MB = 450; // Fly.io 512MB rajan lähellä
 
 if (!DISCORD_TOKEN) {
-  console.error("❌ ERROR: DISCORD_TOKEN is missing from environment variables.");
+  console.error("❌ KRIITTINEN VIRHE: DISCORD_TOKEN puuttuu ympäristömuuttujista.");
   process.exit(1);
 }
 
 // ----------------------------------------------------------------
-// STORAGE & PERSISTENCE
+// TIEDOSTOJÄRJESTELMÄ JA PYSYVYYS (FALLBACK-MEKANISMIT)
 // ----------------------------------------------------------------
-const DATA_FOLDER = path.join(__dirname, "data");
-const AUTH_CACHE_FOLDER = path.join(DATA_FOLDER, "auth");
-const USER_DATABASE_FILE = path.join(DATA_FOLDER, "users.json");
+const DATA_DIR = path.join(__dirname, "data");
+const AUTH_DIR = path.join(DATA_DIR, "auth");
+const DATABASE_FILE = path.join(DATA_DIR, "users.json");
+const DATABASE_BACKUP = path.join(DATA_DIR, "users.json.bak");
 
-// Ensure directories exist
-if (!fs.existsSync(DATA_FOLDER)) {
-  fs.mkdirSync(DATA_FOLDER);
-}
-if (!fs.existsSync(AUTH_CACHE_FOLDER)) {
-  fs.mkdirSync(AUTH_CACHE_FOLDER, { recursive: true });
+// Varmistetaan hakemistojen olemassaolo virheensietoisesti
+try {
+  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR);
+  if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true });
+} catch (err) {
+  console.error("❌ Hakemistojen luonti epäonnistui:", err);
 }
 
-// Load users from local storage
+// Käyttäjätietojen lataus turvallisesti
 let users = {};
-if (fs.existsSync(USER_DATABASE_FILE)) {
-  try {
-    users = JSON.parse(fs.readFileSync(USER_DATABASE_FILE, "utf8"));
-  } catch (err) {
-    console.error("❌ ERROR: Failed to parse users.json", err);
-    users = {};
+try {
+  if (fs.existsSync(DATABASE_FILE)) {
+    users = JSON.parse(fs.readFileSync(DATABASE_FILE, "utf8"));
+  } else if (fs.existsSync(DATABASE_BACKUP)) {
+    // Fallback varmuuskopioon jos pääasiallinen tiedosto on vioittunut
+    users = JSON.parse(fs.readFileSync(DATABASE_BACKUP, "utf8"));
+    console.warn("⚠️ Pääasiallinen tietokanta puuttui, ladattiin varmuuskopio.");
   }
+} catch (err) {
+  console.error("❌ Tietokannan latausvirhe:", err);
+  users = {};
 }
 
 /**
- * Saves the current user state to the JSON file
+ * Tallentaa tietokannan atomisesti (estää korruptoitumisen)
  */
 function saveDatabase() {
-  fs.writeFileSync(USER_DATABASE_FILE, JSON.stringify(users, null, 2));
+  try {
+    const data = JSON.stringify(users, null, 2);
+    const tempPath = DATABASE_FILE + ".tmp";
+    
+    // Kirjoitetaan ensin väliaikaiseen tiedostoon
+    fs.writeFileSync(tempPath, data);
+    
+    // Luodaan varmuuskopio vanhasta versiosta
+    if (fs.existsSync(DATABASE_FILE)) {
+      fs.copyFileSync(DATABASE_FILE, DATABASE_BACKUP);
+    }
+    
+    // Vaihdetaan väliaikainen tiedosto alkuperäiseksi (atominen operaatio monissa järjestelmissä)
+    fs.renameSync(tempPath, DATABASE_FILE);
+  } catch (err) {
+    console.error("❌ Tietokannan tallennus epäonnistui:", err);
+  }
 }
 
 /**
- * Gets or initializes a user object
+ * Hakee käyttäjäprofiilin ja alustaa puuttuvat kentät oletusarvoilla
  */
-function getUserProfile(userId) {
-  if (!users[userId]) {
-    users[userId] = {
+function getProfile(uid) {
+  if (!users[uid]) {
+    users[uid] = {
       connectionType: "online",
       bedrockVersion: "auto",
-      offlineUsername: `AFK_${userId.slice(-4)}`,
+      offlineUsername: `AFK_${uid.slice(-4)}`,
       active: false,
-      server: null
+      server: null,
+      stats: { totalConnections: 0, lastConnected: null }
     };
   }
-  return users[userId];
+  // Varmistetaan rakenteellinen eheys (schema migration)
+  if (!users[uid].stats) users[uid].stats = { totalConnections: 0, lastConnected: null };
+  return users[uid];
 }
 
 /**
- * Returns the path to a specific user's auth cache
+ * Hakee polun käyttäjän Microsoft-istunnon välimuistiin
  */
-function getUserAuthPath(userId) {
-  const userPath = path.join(AUTH_CACHE_FOLDER, userId);
-  if (!fs.existsSync(userPath)) {
-    fs.mkdirSync(userPath, { recursive: true });
-  }
-  return userPath;
+function getAuthPath(uid) {
+  const p = path.join(AUTH_DIR, uid);
+  if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive: true });
+  return p;
 }
 
 // ----------------------------------------------------------------
-// RUNTIME STATE MANAGEMENT
+// AJONAIKAINEN TILANHALLINTA
 // ----------------------------------------------------------------
-const activeSessions = new Map();
-const loginProcesses = new Map();
-let globalAdminPanelMessage = null;
+const sessions = new Map();
+const activeLogins = new Map();
+let adminDashboardMsg = null;
 
-const discordClient = new Client({
+const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.DirectMessages,
@@ -109,656 +141,665 @@ const discordClient = new Client({
 });
 
 // ----------------------------------------------------------------
-// LOGGING & NOTIFICATIONS
+// LOKITUS JA VIESTINTÄ (ERROR TOLERANCE)
 // ----------------------------------------------------------------
 
 /**
- * Sends an embed log to the specified log channel
+ * Lähettää lokitapahtuman Discord-kanavalle virheenhallinnalla
  */
-async function postLog(description, color = "#5865F2") {
+async function pushLog(text, level = "INFO") {
+  const colors = { INFO: "#5865F2", WARN: "#FFCC00", ERROR: "#FF3300", SUCCESS: "#00FF66" };
   try {
-    const channel = await discordClient.channels.fetch(LOG_CHANNEL_ID);
-    if (channel && channel.isTextBased()) {
-      const logEmbed = new EmbedBuilder()
-        .setColor(color)
-        .setDescription(description)
+    const channel = await client.channels.fetch(LOG_CHANNEL_ID).catch(() => null);
+    if (channel) {
+      const embed = new EmbedBuilder()
+        .setColor(colors[level] || colors.INFO)
+        .setDescription(`**[${level}]** ${text}`)
         .setTimestamp();
-      await channel.send({ embeds: [logEmbed] });
+      await channel.send({ embeds: [embed] }).catch(() => {});
     }
+    console.log(`[${level}] ${text}`);
   } catch (err) {
-    console.error("⚠️ Logging failure:", err.message);
+    console.error("Lokitus epäonnistui:", err);
   }
 }
 
 /**
- * Sends a direct message to a user
+ * Lähettää DM-viestin käyttäjälle varmistaen, että kanava on auki
  */
-async function sendDirectMessage(userId, content) {
+async function dmUser(uid, msg) {
   try {
-    const user = await discordClient.users.fetch(userId);
+    const user = await client.users.fetch(uid).catch(() => null);
     if (user) {
-      await user.send(content);
+      await user.send(msg).catch(e => console.warn(`DM esto käyttäjällä ${uid}:`, e.message));
     }
-  } catch (err) {
-    console.warn(`⚠️ Could not DM user ${userId}:`, err.message);
-  }
+  } catch (err) {}
 }
 
 /**
- * Security check for the production server
+ * Tarkistaa onko komento suoritettu oikealla palvelimella
  */
-function validateGuild(interaction) {
+function checkGuild(interaction) {
   if (!interaction.inGuild() || interaction.guildId !== ALLOWED_GUILD_ID) {
-    const response = "This bot is restricted to the official production server ⛔";
-    if (interaction.deferred || interaction.replied) {
-      interaction.editReply(response).catch(() => {});
-    } else {
-      interaction.reply({ ephemeral: true, content: response }).catch(() => {});
-    }
+    const msg = "Tämä botti on rajoitettu vain tuotantopalvelimelle ⛔";
+    if (interaction.deferred || interaction.replied) interaction.editReply(msg).catch(() => {});
+    else interaction.reply({ ephemeral: true, content: msg }).catch(() => {});
     return false;
   }
   return true;
 }
 
 // ----------------------------------------------------------------
-// CORE BOT SESSION LOGIC (RAM OPTIMIZED)
+// BOTIN ISTUNTOLOGIIKKA JA RAM-OPTIMOINTI (SYVÄ TASON FILTER)
 // ----------------------------------------------------------------
 
 /**
- * Fully cleans up a session and its associated memory
+ * Sulkee istunnon ja siivoaa kaikki muistiviitteet välittömästi
  */
-function terminateSession(userId) {
-  const session = activeSessions.get(userId);
+function shutdownSession(uid) {
+  const session = sessions.get(uid);
   if (!session) return;
 
-  if (session.connectionTimeout) clearTimeout(session.connectionTimeout);
+  if (session.timeout) clearTimeout(session.timeout);
   if (session.reconnectTimer) clearTimeout(session.reconnectTimer);
-  if (session.afkMovementInterval) clearInterval(session.afkMovementInterval);
+  if (session.afkTimer) clearInterval(session.afkTimer);
 
   try {
-    if (session.minecraftClient) {
-      session.minecraftClient.removeAllListeners();
-      session.minecraftClient.close();
-      // Set to null to assist Garbage Collection
-      session.minecraftClient = null;
+    if (session.mc) {
+      session.mc.removeAllListeners();
+      session.mc.close();
+      // Nullataan viitteet jotta V8-moottori voi vapauttaa muistin
+      session.mc = null;
     }
-  } catch (err) {
-    console.error(`Error closing client for ${userId}:`, err);
-  }
+  } catch (err) {}
 
-  activeSessions.delete(userId);
+  sessions.delete(uid);
   
-  // Suggest Garbage Collection if the engine supports it
-  if (global.gc) {
-    global.gc();
-  }
+  // Pakotetaan roskienkeruu jos mahdollista
+  if (global.gc) global.gc();
 }
 
 /**
- * Stops a bot session and updates the persistent database
+ * Pysäyttää botin ja tallentaa tilan pysyvästi
  */
-function stopBotSession(userId, isManualAction = true) {
-  const session = activeSessions.get(userId);
-  
-  if (isManualAction) {
-    const profile = getUserProfile(userId);
+function forceStopBot(uid, isManual = true) {
+  const profile = getProfile(uid);
+  if (isManual) {
     profile.active = false;
     saveDatabase();
   }
 
+  const session = sessions.get(uid);
   if (!session) return false;
 
-  if (isManualAction) {
-    session.isManualStop = true;
-  }
-
-  terminateSession(userId);
+  if (isManual) session.manualShutdown = true;
+  shutdownSession(uid);
   return true;
 }
 
 /**
- * Initiates a Minecraft Bedrock connection
+ * Käynnistää Minecraft Bedrock -yhteyden optimoiduilla asetuksilla
  */
-function startBotSession(userId, interaction = null) {
-  const profile = getUserProfile(userId);
+function initiateBot(uid, interaction = null) {
+  const profile = getProfile(uid);
 
+  // Fallback jos asetukset puuttuvat
   if (!profile.server || !profile.server.ip) {
     if (interaction && !interaction.replied) {
-      interaction.editReply("⚠️ Server configuration is missing. Please go to **Settings** first.");
+      interaction.editReply("⚠️ Palvelimen asetukset puuttuvat. Käytä **Asetukset**-painiketta ensin.");
     }
     return;
   }
 
-  // Prevent duplicate sessions
-  if (activeSessions.has(userId)) {
-    const existing = activeSessions.get(userId);
-    if (!existing.isReconnecting) {
-      if (interaction && !interaction.replied) {
-        interaction.editReply("⚠️ Your bot is already online or connecting.");
-      }
-      return;
+  // Estetään päällekkäiset istunnot
+  if (sessions.has(uid) && !sessions.get(uid).isRetrying) {
+    if (interaction && !interaction.replied) {
+      interaction.editReply("⚠️ Bottisi on jo yhdistettynä tai yhdistämässä.");
     }
+    return;
   }
 
-  // Set persistence
   profile.active = true;
   saveDatabase();
 
-  const serverIp = profile.server.ip;
-  const serverPort = parseInt(profile.server.port) || 19132;
+  const ip = profile.server.ip;
+  const port = parseInt(profile.server.port) || 19132;
 
-  const connectionOptions = {
-    host: serverIp,
-    port: serverPort,
-    connectTimeout: CONNECTION_TIMEOUT,
+  const clientOptions = {
+    host: ip,
+    port: port,
+    connectTimeout: CONNECTION_TIMEOUT_MS,
     keepAlive: true,
     version: profile.bedrockVersion === "auto" ? undefined : profile.bedrockVersion
   };
 
+  // Auth-tyypin valinta
   if (profile.connectionType === "offline") {
-    connectionOptions.username = profile.offlineUsername || `AFK_${userId.slice(-4)}`;
-    connectionOptions.offline = true;
+    clientOptions.username = profile.offlineUsername || `AFK_${uid.slice(-4)}`;
+    clientOptions.offline = true;
   } else {
-    connectionOptions.username = userId;
-    connectionOptions.offline = false;
-    connectionOptions.profilesFolder = getUserAuthPath(userId);
+    clientOptions.username = uid;
+    clientOptions.offline = false;
+    clientOptions.profilesFolder = getAuthPath(uid);
   }
 
-  const mcClient = bedrock.createClient(connectionOptions);
+  // Luodaan yhteys
+  let mc;
+  try {
+    mc = bedrock.createClient(clientOptions);
+  } catch (err) {
+    pushLog(`KRIITTINEN: Clientin luonti epäonnistui (<@${uid}>): ${err.message}`, "ERROR");
+    return;
+  }
   
-  let sessionState = activeSessions.get(userId) || {
+  let state = sessions.get(uid) || {
     startedAt: Date.now(),
-    isManualStop: false,
+    manualShutdown: false,
     connected: false,
-    packetCounter: 0,
-    isReconnecting: false
+    packets: 0,
+    isRetrying: false,
+    retryCount: 0
   };
 
-  sessionState.minecraftClient = mcClient;
-  sessionState.isReconnecting = false;
-  activeSessions.set(userId, sessionState);
+  state.mc = mc;
+  state.isRetrying = false;
+  sessions.set(uid, state);
 
   // ------------------------------------------------------------
-  // RAM OPTIMIZATION: HEAVY PACKET FILTERING
-  // This prevents the bot from storing chunk and entity data in RAM.
+  // SYVÄ RAM-OPTIMOINTI: Pakettien suodatus lennosta
+  // Tämä on botin tärkein osa muistinkulutuksen hallinnassa.
   // ------------------------------------------------------------
-  mcClient.on('packet', (packet) => {
-    sessionState.packetCounter++;
+  mc.on('packet', (packet) => {
+    state.packets++;
     
-    const packetName = packet.data.name;
+    const pName = packet.data.name;
 
-    // List of memory-heavy world data packets we do NOT need
+    // Suodatetaan kaikki muistia kuluttavat maailma- ja entiteettipaketit
+    // Botti on vain AFK-varten, joten se ei tarvitse tietoa ympäröivästä maailmasta.
     if (
-      packetName === 'level_chunk' || 
-      packetName === 'subchunk' || 
-      packetName === 'level_event' ||
-      packetName === 'level_sound_event' ||
-      packetName === 'level_event_generic' ||
-      packetName === 'player_list' ||
-      packetName === 'add_entity' ||
-      packetName === 'add_player' ||
-      packetName === 'remove_entity' ||
-      packetName === 'mob_equipment_packet' ||
-      packetName === 'mob_armor_equipment' ||
-      packetName === 'metadata_dictionary'
+      pName.includes('chunk') || 
+      pName.includes('level') || 
+      pName.includes('entity') || 
+      pName.includes('metadata') || 
+      pName.includes('player_list') ||
+      pName.includes('sound') ||
+      pName.includes('particle')
     ) {
-      // Void the payload to free memory immediately
+      // Tuhoaa paketin sisällön ennen kuin se ehtii puskuroitua Node.js:n heap-muistiin.
       if (packet.data.payload) packet.data.payload = null;
       packet.data = null; 
+      packet = null;
     }
   });
 
   // ------------------------------------------------------------
-  // CONNECTION HANDLING
+  // YHTEYDEN TAPAHTUMAHALLINTA
   // ------------------------------------------------------------
 
-  // Support for Geyser and standard Bedrock servers
-  mcClient.on('play_status', (packet) => {
-    if ((packet.status === 'player_spawn' || packet.status === 'login_success') && !sessionState.connected) {
-      onSuccessfulSpawn(userId, mcClient, sessionState, interaction, serverIp, serverPort);
-    }
-  });
-
-  mcClient.on("spawn", () => {
-    if (!sessionState.connected) {
-      onSuccessfulSpawn(userId, mcClient, sessionState, interaction, serverIp, serverPort);
-    }
-  });
-
-  // Timeout logic
-  sessionState.connectionTimeout = setTimeout(() => {
-    if (activeSessions.has(userId) && !sessionState.connected) {
-      if (interaction && interaction.deferred) {
-        interaction.editReply("❌ Connection timed out (25s). The server might be offline or slow.");
-      }
-      mcClient.close();
-    }
-  }, CONNECTION_TIMEOUT);
-
-  mcClient.on("error", (err) => {
-    clearTimeout(sessionState.connectionTimeout);
-    postLog(`❌ Error for <@${userId}>: \`${err.message}\``, "#FF0000");
-    if (!sessionState.isManualStop) {
-      initiateAutoReconnect(userId, interaction);
-    }
-  });
-
-  mcClient.on("close", () => {
-    clearTimeout(sessionState.connectionTimeout);
-    postLog(`🔌 Connection closed for <@${userId}>`, "#808080");
-    if (!sessionState.isManualStop) {
-      initiateAutoReconnect(userId, interaction);
-    }
-  });
-}
-
-/**
- * Runs logic when the bot successfully enters the world
- */
-function onSuccessfulSpawn(userId, mcClient, sessionState, interaction, ip, port) {
-  sessionState.connected = true;
-  clearTimeout(sessionState.connectionTimeout);
-  
-  if (interaction && interaction.deferred) {
-    interaction.editReply(`🟢 Successfully online at **${ip}:${port}** (Persistent Session)`);
-  }
-  
-  postLog(`✅ Bot for <@${userId}> is now **Online** at ${ip}`, "#00FF00");
-
-  // AFK Movement Logic (Anti-Kick)
-  sessionState.afkMovementInterval = setInterval(() => {
-    try {
-      if (!mcClient.entityId) return;
+  // Tunnistaa onnistuneen spawnauksen (Geyser/Vanilla)
+  const onReady = () => {
+    if (!state.connected) {
+      state.connected = true;
+      state.retryCount = 0; // Nollataan yritykset onnistumisen jälkeen
+      clearTimeout(state.timeout);
       
-      const currentPos = mcClient.entity?.position || { x: 0, y: 0, z: 0 };
-      
-      // Send a minimal movement packet to stay active
-      mcClient.write("move_player", {
-        runtime_id: mcClient.entityId,
-        position: currentPos,
-        pitch: 0,
-        yaw: 0,
-        head_yaw: 0,
-        mode: 0,
-        on_ground: true,
-        ridden_runtime_id: 0,
-        teleport: false
-      });
-    } catch (err) {}
-  }, 60000); // 1 minute interval
-}
-
-/**
- * Handles automatic reconnection attempts
- */
-function initiateAutoReconnect(userId, interaction) {
-  const session = activeSessions.get(userId);
-  if (!session || session.isManualStop || session.reconnectTimer) return;
-
-  session.isReconnecting = true;
-  session.connected = false;
-
-  // Wait 2 minutes before retrying
-  session.reconnectTimer = setTimeout(() => {
-    if (activeSessions.has(userId) && !session.isManualStop) {
-      session.reconnectTimer = null;
-      startBotSession(userId, interaction);
-    }
-  }, 120000);
-}
-
-// ----------------------------------------------------------------
-// MICROSOFT AUTHENTICATION FLOW
-// ----------------------------------------------------------------
-
-/**
- * Handles the Microsoft linking process
- */
-async function handleMicrosoftLink(userId, interaction) {
-  if (loginProcesses.has(userId)) {
-    return interaction.editReply("⏳ A login process is already active for your account.");
-  }
-
-  const authPath = getUserAuthPath(userId);
-  const profile = getUserProfile(userId);
-
-  const flow = new Authflow(userId, authPath, {
-    flow: "live",
-    authTitle: Titles.MinecraftNintendoSwitch,
-    deviceType: "Nintendo"
-  }, async (data) => {
-    const authEmbed = new EmbedBuilder()
-      .setTitle("🔐 Microsoft Authentication")
-      .setDescription(
-        `Please follow these steps to link your account:\n\n` +
-        `1. Go to: **${data.verification_uri_complete}**\n` +
-        `2. Confirm the code: **\`${data.user_code}\`**\n\n` +
-        `*Tip: Use a dedicated AFK account, not your main account.*`
-      )
-      .setColor("#5865F2");
-    
-    const actionRow = new ActionRowBuilder().addComponents(
-      new ButtonBuilder()
-        .setLabel("Open Login Page")
-        .setStyle(ButtonStyle.Link)
-        .setURL(data.verification_uri_complete)
-    );
-
-    await interaction.editReply({ content: null, embeds: [authEmbed], components: [actionRow] });
-  });
-
-  const linkPromise = (async () => {
-    try {
-      await flow.getMsaToken();
-      profile.linked = true;
+      profile.stats.totalConnections++;
+      profile.stats.lastConnected = new Date().toISOString();
       saveDatabase();
-      
-      await interaction.followUp({ ephemeral: true, content: "✅ Your Microsoft account has been linked successfully!" });
-      postLog(`🔑 User <@${userId}> linked a Microsoft account.`);
-    } catch (err) {
-      await interaction.followUp({ ephemeral: true, content: `❌ Authentication failed: ${err.message}` });
-    } finally {
-      loginProcesses.delete(userId);
-    }
-  })();
 
-  loginProcesses.set(userId, linkPromise);
+      if (interaction && interaction.deferred) {
+        interaction.editReply(`🟢 Yhdistetty onnistuneesti: **${ip}:${port}** (RAM-optimoitu)`);
+      }
+      
+      pushLog(`✅ Botti <@${uid}> Online @ ${ip}`, "SUCCESS");
+
+      // AFK-liike (varmistaa ettei bottia potkita toimettomuuden vuoksi)
+      state.afkTimer = setInterval(() => {
+        try {
+          if (!mc.entityId) return;
+          // Lähetetään minimaalinen liike-paketti (keep-alive)
+          mc.write("move_player", {
+            runtime_id: mc.entityId,
+            position: mc.entity?.position || { x: 0, y: 0, z: 0 },
+            pitch: 0, yaw: 0, head_yaw: 0, mode: 0, on_ground: true, ridden_runtime_id: 0, teleport: false
+          });
+        } catch (err) {}
+      }, 60000);
+    }
+  };
+
+  mc.on('play_status', (p) => {
+    if (p.status === 'player_spawn' || p.status === 'login_success') onReady();
+  });
+
+  mc.on("spawn", onReady);
+
+  // Aikakatkaisu jos serveri ei vastaa 25 sekunnissa
+  state.timeout = setTimeout(() => {
+    if (sessions.has(uid) && !state.connected) {
+      if (interaction && interaction.deferred) {
+        interaction.editReply("❌ Yhteysvirhe: Palvelin ei vastannut aikarajan puitteissa (25s).");
+      }
+      mc.close();
+    }
+  }, CONNECTION_TIMEOUT_MS);
+
+  // Virheidenhallinta ja automaattinen uudelleenkytkentä
+  mc.on("error", (err) => {
+    clearTimeout(state.timeout);
+    pushLog(`❌ Virhe <@${uid}>: \`${err.message}\``, "ERROR");
+    if (!state.manualShutdown) triggerReconnect(uid, interaction);
+  });
+
+  mc.on("close", () => {
+    clearTimeout(state.timeout);
+    pushLog(`🔌 Yhteys katkesi <@${uid}>`, "WARN");
+    if (!state.manualShutdown) triggerReconnect(uid, interaction);
+  });
+}
+
+/**
+ * Laskee eksponentiaalisen viiveen ja yrittää uudelleenliittymistä
+ */
+function triggerReconnect(uid, interaction) {
+  const session = sessions.get(uid);
+  if (!session || session.manualShutdown || session.reconnectTimer) return;
+
+  session.isRetrying = true;
+  session.connected = false;
+  session.retryCount++;
+
+  if (session.retryCount > MAX_RECONNECT_ATTEMPTS) {
+    pushLog(`🚫 Botti <@${uid}>: Liikaa epäonnistuneita yrityksiä. Pysäytetään automaatio.`, "ERROR");
+    dmUser(uid, "⚠️ Bottisi yritti yhdistää liian monta kertaa palvelimeen tuloksetta. Automaattinen uudelleenkytkentä on poistettu käytöstä.");
+    forceStopBot(uid, true);
+    return;
+  }
+
+  // Eksponentiaalinen odotus: 30s, 60s, 120s, jne. (max 10min)
+  const delay = Math.min(30000 * Math.pow(2, Math.min(session.retryCount - 1, 4)), 600000);
+
+  session.reconnectTimer = setTimeout(() => {
+    if (sessions.has(uid) && !session.manualShutdown) {
+      session.reconnectTimer = null;
+      initiateBot(uid, interaction);
+    }
+  }, delay);
 }
 
 // ----------------------------------------------------------------
-// ADMIN INTERFACE & DASHBOARD
+// MICROSOFT AUTHENTICATION (RELIABILITY UPDATES)
 // ----------------------------------------------------------------
 
 /**
- * Generates the system analytics embed
+ * Hoitaa Microsoft-tunnistautumisen aikarajoilla ja virheensiedolla
  */
-function generateAdminEmbed() {
-  const memUsage = process.memoryUsage();
-  const uptimeSeconds = process.uptime();
-  
-  const ramMb = (memUsage.rss / 1024 / 1024).toFixed(2);
-  const hours = Math.floor(uptimeSeconds / 3600);
-  const minutes = Math.floor((uptimeSeconds % 3600) / 60);
+async function processMicrosoftLink(uid, interaction) {
+  if (activeLogins.has(uid)) {
+    return interaction.editReply("⏳ Kirjautumisprosessi on jo käynnissä. Odota tai yritä myöhemmin.");
+  }
 
-  const statsEmbed = new EmbedBuilder()
-    .setTitle("🚀 Production Admin Dashboard")
-    .setColor("#2B2D31")
+  // Välitön vastaus jotta Discord ei aikakatkaise
+  await interaction.editReply("⏳ Pyydetään kirjautumiskoodia Microsoftilta... (Tässä voi kestää hetki)");
+
+  const authDir = getAuthPath(uid);
+  const profile = getProfile(uid);
+
+  // Asetetaan turva-aikakatkaisu koko prosessille
+  const loginTimeout = setTimeout(() => {
+    if (activeLogins.has(uid)) {
+      activeLogins.delete(uid);
+      interaction.editReply("❌ Kirjautumisprosessi aikakatkaistiin (5min raja ylittyi).").catch(() => {});
+    }
+  }, AUTH_PROCESS_TIMEOUT_MS);
+
+  try {
+    const flow = new Authflow(uid, authDir, {
+      flow: "live",
+      authTitle: Titles.MinecraftNintendoSwitch,
+      deviceType: "Nintendo"
+    }, async (data) => {
+      // Näytetään koodi käyttäjälle heti kun se on saatavilla
+      const embed = new EmbedBuilder()
+        .setTitle("🔐 Microsoft Kirjautuminen")
+        .setDescription(
+          `**Vahvistuskoodi:** \`${data.user_code}\`\n\n` +
+          `1. Paina alla olevaa painiketta ja kirjaudu sisään.\n` +
+          `2. Syötä koodi sille varattuun kenttään.\n\n` +
+          `*Botti päivittyy automaattisesti kun olet valmis.*`
+        )
+        .setColor("#5865F2");
+      
+      const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setLabel("Kirjaudu Microsoftilla")
+          .setStyle(ButtonStyle.Link)
+          .setURL(data.verification_uri_complete)
+      );
+
+      await interaction.editReply({ content: null, embeds: [embed], components: [row] }).catch(() => {});
+    });
+
+    const flowPromise = (async () => {
+      try {
+        await flow.getMsaToken();
+        clearTimeout(loginTimeout);
+        
+        profile.linked = true;
+        saveDatabase();
+        
+        await interaction.followUp({ ephemeral: true, content: "✅ Microsoft-tilisi on nyt linkitetty onnistuneesti!" });
+        pushLog(`🔑 Käyttäjä <@${uid}> linkitti Microsoft-tilin.`, "SUCCESS");
+      } catch (err) {
+        clearTimeout(loginTimeout);
+        await interaction.followUp({ ephemeral: true, content: `❌ Kirjautumisvirhe: ${err.message}` });
+      } finally {
+        activeLogins.delete(uid);
+      }
+    })();
+
+    activeLogins.set(uid, flowPromise);
+
+  } catch (err) {
+    clearTimeout(loginTimeout);
+    activeLogins.delete(uid);
+    await interaction.editReply(`❌ Alustusvirhe: ${err.message}`);
+  }
+}
+
+// ----------------------------------------------------------------
+// ADMIN DASHBOARD (DETAILED ANALYTICS)
+// ----------------------------------------------------------------
+
+/**
+ * Luo kattavan analytiikka-embedin ylläpitoa varten
+ */
+function buildAdminStats() {
+  const mem = process.memoryUsage();
+  const uptime = process.uptime();
+  
+  // Lasketaan muistinkulutus ja järjestelmän tila
+  const rss = (mem.rss / 1024 / 1024).toFixed(2);
+  const heap = (mem.heapUsed / 1024 / 1024).toFixed(2);
+  const h = Math.floor(uptime / 3600);
+  const m = Math.floor((uptime % 3600) / 60);
+
+  // Varoitus jos muisti on vähissä (Fly.io)
+  const isCritical = parseFloat(rss) > RAM_CRITICAL_THRESHOLD_MB;
+
+  const embed = new EmbedBuilder()
+    .setTitle("🚀 Tuotannon Hallintapaneeli")
+    .setColor(isCritical ? "#FF0000" : "#2B2D31")
     .addFields(
       { 
-        name: "💻 System Status", 
-        value: `**RAM Usage:** ${ramMb} MB\n**Uptime:** ${hours}h ${minutes}m\n**Active Bots:** ${activeSessions.size}`, 
+        name: "💻 Järjestelmä", 
+        value: `**RAM (RSS):** ${rss} MB ${isCritical ? '⚠️' : ''}\n**Heap:** ${heap} MB\n**Uptime:** ${h}h ${m}m`, 
         inline: true 
       },
       { 
-        name: "📂 Storage Stats", 
-        value: `**Linked Users:** ${Object.keys(users).length}\n**Volume:** /app/data\n**Auto-Restore:** ENABLED`, 
+        name: "🤖 Botit", 
+        value: `**Aktiiviset:** ${sessions.size}\n**Käyttäjät:** ${Object.keys(users).length}\n**Auto-Restore:** Kyllä`, 
         inline: true 
       }
     )
     .setTimestamp()
-    .setFooter({ text: "Real-time Analytics • No Chunks Loaded" });
+    .setFooter({ text: `Pakettisuodatin: Aktiivinen • Tarkistus 30s välein` });
 
-  if (activeSessions.size > 0) {
-    let sessionList = "";
-    for (const [id, s] of activeSessions) {
-      const statusIcon = s.connected ? "🟢" : (s.isReconnecting ? "⏳" : "🔴");
-      sessionList += `${statusIcon} <@${id}> (${s.packetCounter} pkts)\n`;
+  if (sessions.size > 0) {
+    let botList = "";
+    for (const [id, s] of sessions) {
+      const status = s.connected ? "🟢" : (s.isRetrying ? "⏳" : "🔴");
+      botList += `${status} <@${id}> (${s.packets} pkt)\n`;
     }
-    statsEmbed.addFields({ name: "🤖 Live Session Feed", value: sessionList.slice(0, 1024) });
-  } else {
-    statsEmbed.addFields({ name: "🤖 Live Session Feed", value: "No active bot connections." });
+    embed.addFields({ name: "Aktiiviset Istunnot", value: botList.slice(0, 1024) });
   }
 
-  return statsEmbed;
+  return embed;
 }
 
 /**
- * Generates buttons and menus for the admin panel
+ * Luo hallintapainikkeet admin-paneeliin
  */
-function generateAdminControls() {
-  const controlRows = [
+function buildAdminTools() {
+  const rows = [
     new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId("adm_refresh").setLabel("Refresh Stats").setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId("adm_stop_all").setLabel("Force Stop All").setStyle(ButtonStyle.Danger)
+      new ButtonBuilder().setCustomId("adm_update").setLabel("Päivitä Tilastot").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("adm_kill_all").setLabel("Pysäytä Kaikki").setStyle(ButtonStyle.Danger)
     )
   ];
 
-  if (activeSessions.size > 0) {
-    const botOptions = Array.from(activeSessions.keys()).slice(0, 25).map(id => {
-      const s = activeSessions.get(id);
-      return {
-        label: `User: ${id}`,
-        description: s.connected ? "Status: Online" : "Status: Connecting",
-        value: id
-      };
-    });
+  if (sessions.size > 0) {
+    const options = Array.from(sessions.keys()).slice(0, 25).map(id => ({
+      label: `Käyttäjä: ${id}`,
+      description: sessions.get(id).connected ? "Online" : "Yhdistää",
+      value: id
+    }));
 
-    controlRows.push(
+    rows.push(
       new ActionRowBuilder().addComponents(
         new StringSelectMenuBuilder()
-          .setCustomId("adm_force_stop")
-          .setPlaceholder("Select a session to terminate")
-          .addOptions(botOptions)
+          .setCustomId("adm_kill_single")
+          .setPlaceholder("Lopeta tietty istunto")
+          .addOptions(options)
       )
     );
   }
 
-  return controlRows;
+  return rows;
 }
 
 // ----------------------------------------------------------------
-// DISCORD INTERACTION HANDLERS
+// DISCORD-TAPAHTUMAT JA ELINKAARI
 // ----------------------------------------------------------------
 
-discordClient.once("ready", async () => {
-  console.log(`🟢 Bot Production Instance is Live: ${discordClient.user.tag}`);
+client.once("ready", async () => {
+  console.log(`🟢 Bottu on Online: ${client.user.tag}`);
 
-  const slashCommands = [
-    new SlashCommandBuilder().setName("panel").setDescription("Access the AFK Bot control panel"),
-    new SlashCommandBuilder().setName("admin").setDescription("Access production analytics (Owner only)")
+  // Rekisteröidään slash-komennot
+  const commands = [
+    new SlashCommandBuilder().setName("panel").setDescription("Avaa AFK-botin hallintapaneeli"),
+    new SlashCommandBuilder().setName("admin").setDescription("Ylläpidon analytiikka (Vain omistaja)")
   ];
-
-  await discordClient.application.commands.set(slashCommands);
+  await client.application.commands.set(commands).catch(console.error);
 
   // ------------------------------------------------------------
-  // AUTO-RESTORE LOGIC (Survivor Mode)
-  // This reconnects all bots that were active before a deployment.
+  // AUTO-RESTORE (BLACKDOWN-SUOJAUS)
+  // Palauttaa kaikki botit jotka olivat päällä ennen deployausta.
   // ------------------------------------------------------------
-  const activeUserIds = Object.keys(users).filter(id => users[id].active === true);
+  const restoreList = Object.keys(users).filter(id => users[id].active === true);
   
-  if (activeUserIds.length > 0) {
-    postLog(`♻️ **Auto-Restore Initiated**: Deployment finished. Reconnecting ${activeUserIds.length} sessions...`);
+  if (restoreList.length > 0) {
+    pushLog(`♻️ **Auto-Restore**: Käynnistetään ${restoreList.length} istuntoa uudelleen...`, "INFO");
     
-    // Stagger starts every 3 seconds to avoid CPU spikes
-    activeUserIds.forEach((id, index) => {
+    // Staggeroidaan käynnistykset 4 sekunnin välein CPU-piikkien välttämiseksi
+    restoreList.forEach((id, index) => {
       setTimeout(() => {
-        startBotSession(id);
-      }, index * 3000);
+        initiateBot(id);
+      }, index * 4000);
     });
   }
 
-  // Admin Dashboard Auto-Refresh Loop
+  // Admin-paneelin automaattinen päivitys (30 sekunnin sykli)
   setInterval(async () => {
-    if (globalAdminPanelMessage) {
+    if (adminDashboardMsg) {
       try {
-        await globalAdminPanelMessage.edit({
-          embeds: [generateAdminEmbed()],
-          components: generateAdminControls()
+        await adminDashboardMsg.edit({
+          embeds: [buildAdminStats()],
+          components: buildAdminTools()
         });
       } catch (err) {
-        globalAdminPanelMessage = null; // Reset if message was deleted
+        adminDashboardMsg = null;
       }
     }
-  }, 30000); // 30 seconds
+    
+    // RAM Watchdog: Pakotetaan muistinpuhdistus jos ollaan lähellä rajaa
+    const currentRss = process.memoryUsage().rss / 1024 / 1024;
+    if (currentRss > RAM_CRITICAL_THRESHOLD_MB && global.gc) {
+      console.warn(`🚨 KRIITTINEN MUISTINKULUTUS (${currentRss.toFixed(2)} MB). Pakotetaan GC.`);
+      global.gc();
+    }
+  }, 30000);
 });
 
-discordClient.on(Events.InteractionCreate, async (interaction) => {
+client.on(Events.InteractionCreate, async (interaction) => {
   try {
-    if (!validateGuild(interaction)) return;
-    const callerId = interaction.user.id;
+    if (!checkGuild(interaction)) return;
+    const user = interaction.user;
 
-    // --- SLASH COMMANDS ---
+    // --- SLASH-KOMENNOT ---
     if (interaction.isChatInputCommand()) {
       if (interaction.commandName === "panel") {
-        const panelEmbed = new EmbedBuilder()
-          .setTitle("🎛 AFK Bot Control Center")
-          .setDescription("Use the buttons below to manage your Minecraft AFK bot.")
-          .setColor("#2F3136");
-
-        const userRow = new ActionRowBuilder().addComponents(
-          new ButtonBuilder().setCustomId("btn_link").setLabel("Link Microsoft").setStyle(ButtonStyle.Primary),
-          new ButtonBuilder().setCustomId("btn_unlink").setLabel("Unlink").setStyle(ButtonStyle.Secondary),
-          new ButtonBuilder().setCustomId("btn_start").setLabel("Start Bot").setStyle(ButtonStyle.Success),
-          new ButtonBuilder().setCustomId("btn_stop").setLabel("Stop Bot").setStyle(ButtonStyle.Danger),
-          new ButtonBuilder().setCustomId("btn_settings").setLabel("Settings").setStyle(ButtonStyle.Secondary)
+        const row = new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId("btn_link").setLabel("Linkitä Microsoft").setStyle(ButtonStyle.Primary),
+          new ButtonBuilder().setCustomId("btn_unlink").setLabel("Poista Linkitys").setStyle(ButtonStyle.Secondary),
+          new ButtonBuilder().setCustomId("btn_start").setLabel("Start").setStyle(ButtonStyle.Success),
+          new ButtonBuilder().setCustomId("btn_stop").setLabel("Stop").setStyle(ButtonStyle.Danger),
+          new ButtonBuilder().setCustomId("btn_settings").setLabel("Asetukset").setStyle(ButtonStyle.Secondary)
         );
 
-        return interaction.reply({ embeds: [panelEmbed], components: [userRow] });
+        return interaction.reply({ content: "🎛 **AFK Bot Hallinta**", components: [row] });
       }
 
       if (interaction.commandName === "admin") {
-        if (callerId !== ADMIN_ID) {
-          return interaction.reply({ content: "⛔ Access denied. This command is restricted to the bot owner.", ephemeral: true });
+        if (user.id !== ADMIN_ID) {
+          return interaction.reply({ content: "⛔ Ei pääsyä. Tämä komento on rajattu ylläpidolle.", ephemeral: true });
         }
         if (interaction.channelId !== ADMIN_CHANNEL_ID) {
-          return interaction.reply({ content: `⛔ Please use this command in the admin channel: <#${ADMIN_CHANNEL_ID}>`, ephemeral: true });
+          return interaction.reply({ content: `⛔ Käytä tätä komentoa admin-kanavalla: <#${ADMIN_CHANNEL_ID}>`, ephemeral: true });
         }
 
-        const adminMsg = await interaction.reply({
-          embeds: [generateAdminEmbed()],
-          components: generateAdminControls(),
+        adminDashboardMsg = await interaction.reply({
+          embeds: [buildAdminStats()],
+          components: buildAdminTools(),
           fetchReply: true
         });
-        globalAdminPanelMessage = adminMsg;
         return;
       }
     }
 
-    // --- BUTTON CLICKS ---
+    // --- PAINIKKEET ---
     if (interaction.isButton()) {
       const cid = interaction.customId;
 
-      // Admin Actions
-      if (cid === "adm_refresh") {
-        if (callerId !== ADMIN_ID) return;
-        return interaction.update({ embeds: [generateAdminEmbed()], components: generateAdminControls() });
+      // Admin Toiminnot
+      if (cid === "adm_update") {
+        if (user.id !== ADMIN_ID) return;
+        return interaction.update({ embeds: [buildAdminStats()], components: buildAdminTools() });
       }
 
-      if (cid === "adm_stop_all") {
-        if (callerId !== ADMIN_ID) return;
-        const total = activeSessions.size;
-        for (const [uid, session] of activeSessions) {
-          stopBotSession(uid, true);
-          await sendDirectMessage(uid, "⚠️ Your AFK bot has been force-stopped by the administrator.");
+      if (cid === "adm_kill_all") {
+        if (user.id !== ADMIN_ID) return;
+        const count = sessions.size;
+        for (const [id, s] of sessions) {
+          forceStopBot(id, true);
+          dmUser(id, "⚠️ Ylläpito on pysäyttänyt AFK-bottisi järjestelmän huollon vuoksi.");
         }
-        postLog(`🚨 **Admin Action**: Force-stopped all ${total} sessions.`);
-        return interaction.reply({ content: `✅ All ${total} sessions have been terminated.`, ephemeral: true });
+        pushLog(`🚨 **Ylläpito**: Pysäytetty kaikki ${count} istuntoa.`, "WARN");
+        return interaction.reply({ content: `✅ Kaikki ${count} istuntoa lopetettu.`, ephemeral: true });
       }
 
-      // User Actions
+      // Käyttäjätoiminnot
       if (cid === "btn_link") {
         await interaction.deferReply({ ephemeral: true });
-        return handleMicrosoftLink(callerId, interaction);
+        return processMicrosoftLink(user.id, interaction);
       }
 
       if (cid === "btn_unlink") {
-        const authPath = getUserAuthPath(callerId);
+        const authPath = getAuthPath(user.id);
         if (fs.existsSync(authPath)) {
           fs.rmSync(authPath, { recursive: true, force: true });
         }
-        const profile = getUserProfile(callerId);
+        const profile = getProfile(user.id);
         profile.linked = false;
         profile.active = false;
         saveDatabase();
-        postLog(`🗑 User <@${callerId}> removed their Microsoft link.`);
-        return interaction.reply({ content: "🗑 Your Microsoft link and session cache have been cleared.", ephemeral: true });
+        pushLog(`🗑 Käyttäjä <@${user.id}> poisti linkityksen.`, "INFO");
+        return interaction.reply({ content: "🗑 Microsoft-linkitys ja välimuisti on poistettu.", ephemeral: true });
       }
 
       if (cid === "btn_start") {
         await interaction.deferReply({ ephemeral: true });
-        return startBotSession(callerId, interaction);
+        return initiateBot(user.id, interaction);
       }
 
       if (cid === "btn_stop") {
-        if (stopBotSession(callerId, true)) {
-          postLog(`⏹ User <@${callerId}> stopped their bot.`);
-          return interaction.reply({ content: "⏹ Bot session stopped.", ephemeral: true });
+        if (forceStopBot(user.id, true)) {
+          pushLog(`⏹ Käyttäjä <@${user.id}> pysäytti botin.`, "INFO");
+          return interaction.reply({ content: "⏹ Botti pysäytetty.", ephemeral: true });
         }
-        return interaction.reply({ content: "❌ You don't have an active bot session.", ephemeral: true });
+        return interaction.reply({ content: "❌ Sinulla ei ole aktiivista istuntoa.", ephemeral: true });
       }
 
       if (cid === "btn_settings") {
-        const profile = getUserProfile(callerId);
-        const settingsModal = new ModalBuilder().setCustomId("modal_settings").setTitle("Bot Configuration");
+        const profile = getProfile(user.id);
+        const modal = new ModalBuilder().setCustomId("modal_set").setTitle("Botin Asetukset");
 
         const ipInput = new TextInputBuilder()
-          .setCustomId("field_ip")
-          .setLabel("Server IP / Address")
+          .setCustomId("in_ip")
+          .setLabel("Palvelimen IP / Osoite")
           .setStyle(TextInputStyle.Short)
-          .setPlaceholder("e.g. survival.example.com")
           .setRequired(true)
           .setValue(profile.server?.ip || "");
 
         const portInput = new TextInputBuilder()
-          .setCustomId("field_port")
-          .setLabel("Port (Default 19132)")
+          .setCustomId("in_port")
+          .setLabel("Portti (Oletus 19132)")
           .setStyle(TextInputStyle.Short)
-          .setPlaceholder("19132")
           .setRequired(true)
           .setValue(String(profile.server?.port || 19132));
 
-        const offlineNameInput = new TextInputBuilder()
-          .setCustomId("field_offline")
-          .setLabel("Offline Username (Cracked mode only)")
+        const offlineInput = new TextInputBuilder()
+          .setCustomId("in_off")
+          .setLabel("Offline Nimi (Vain Cracked-tilassa)")
           .setStyle(TextInputStyle.Short)
           .setRequired(false)
           .setValue(profile.offlineUsername || "");
 
-        settingsModal.addComponents(
+        modal.addComponents(
           new ActionRowBuilder().addComponents(ipInput),
           new ActionRowBuilder().addComponents(portInput),
-          new ActionRowBuilder().addComponents(offlineNameInput)
+          new ActionRowBuilder().addComponents(offlineInput)
         );
 
-        return interaction.showModal(settingsModal);
+        return interaction.showModal(modal);
       }
     }
 
-    // --- MENU SELECTIONS ---
+    // --- VALIKOT ---
     if (interaction.isStringSelectMenu()) {
-      if (interaction.customId === "adm_force_stop") {
-        if (callerId !== ADMIN_ID) return;
+      if (interaction.customId === "adm_kill_single") {
+        if (user.id !== ADMIN_ID) return;
         const targetId = interaction.values[0];
-        if (stopBotSession(targetId, true)) {
-          await sendDirectMessage(targetId, "⚠️ Your AFK bot has been force-stopped by the administrator.");
-          postLog(`🚨 **Admin Action**: Force-stopped bot for <@${targetId}>`);
-          return interaction.reply({ content: `✅ Session for <@${targetId}> has been terminated.`, ephemeral: true });
+        if (forceStopBot(targetId, true)) {
+          dmUser(targetId, "⚠️ Ylläpito on pysäyttänyt AFK-bottisi.");
+          pushLog(`🚨 **Ylläpito**: Pakotettu lopetus käyttäjälle <@${targetId}>`, "WARN");
+          return interaction.reply({ content: `✅ Istunto <@${targetId}> lopetettu.`, ephemeral: true });
         }
       }
     }
 
-    // --- MODAL SUBMISSIONS ---
-    if (interaction.isModalSubmit() && interaction.customId === "modal_settings") {
-      const newIp = interaction.fields.getTextInputValue("field_ip").trim();
-      const newPort = interaction.fields.getTextInputValue("field_port").trim();
-      const newOffline = interaction.fields.getTextInputValue("field_offline").trim();
+    // --- MODAALIT ---
+    if (interaction.isModalSubmit() && interaction.customId === "modal_set") {
+      const ip = interaction.fields.getTextInputValue("in_ip").trim();
+      const port = interaction.fields.getTextInputValue("in_port").trim();
+      const offline = interaction.fields.getTextInputValue("in_off").trim();
 
-      const profile = getUserProfile(callerId);
-      profile.server = { ip: newIp, port: newPort };
-      if (newOffline) profile.offlineUsername = newOffline;
+      const profile = getProfile(user.id);
+      profile.server = { ip, port };
+      if (offline) profile.offlineUsername = offline;
       
       saveDatabase();
-      return interaction.reply({ content: `✅ Settings saved! Server: **${newIp}:${newPort}**`, ephemeral: true });
+      return interaction.reply({ content: `✅ Asetukset tallennettu! Osoite: **${ip}:${port}**`, ephemeral: true });
     }
 
   } catch (err) {
-    console.error("🔥 CRITICAL INTERACTION ERROR:", err);
+    console.error("🔥 INTERACTION ERROR:", err);
   }
 });
 
-// Process-level error handling to keep the bot alive
-process.on("unhandledRejection", (err) => console.error("Unhandled Promise Rejection:", err));
+// Globaali virheidenhallinta prosessitasolla
+process.on("unhandledRejection", (err) => console.error("Unhandled Rejection:", err));
 process.on("uncaughtException", (err) => console.error("Uncaught Exception:", err));
 
-discordClient.login(DISCORD_TOKEN);
+client.login(DISCORD_TOKEN);
 
