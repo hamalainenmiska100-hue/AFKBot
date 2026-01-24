@@ -9,7 +9,8 @@ const {
   ModalBuilder,
   TextInputBuilder,
   TextInputStyle,
-  StringSelectMenuBuilder
+  StringSelectMenuBuilder,
+  EmbedBuilder
 } = require("discord.js");
 
 const bedrock = require("bedrock-protocol");
@@ -24,8 +25,9 @@ if (!DISCORD_TOKEN) {
 }
 
 const ALLOWED_GUILD_ID = "1462335230345089254";
+const ADMIN_CHANNEL_ID = "1464615993320935447";
 
-// ----------------- Säilytys -----------------
+// ----------------- Storage -----------------
 const DATA = path.join(__dirname, "data");
 const AUTH_ROOT = path.join(DATA, "auth");
 const STORE = path.join(DATA, "users.json");
@@ -73,7 +75,7 @@ const client = new Client({
 
 function denyIfWrongGuild(i) {
   if (!i.inGuild() || i.guildId !== ALLOWED_GUILD_ID) {
-    const msg = "Tätä bottia ei voi käyttää tällä palvelimella ⛔️";
+    const msg = "This bot cannot be used in this server ⛔️";
     if (i.deferred) return i.editReply(msg).catch(() => {});
     if (i.replied) return i.followUp({ ephemeral: true, content: msg }).catch(() => {});
     return i.reply({ ephemeral: true, content: msg }).catch(() => {});
@@ -81,33 +83,47 @@ function denyIfWrongGuild(i) {
   return null;
 }
 
-// ----------------- UI-apulaiset -----------------
+// ----------------- UI Helpers -----------------
 function panelRow() {
   return [
     new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId("link").setLabel("🔑 Linkitä Microsoft").setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId("unlink").setLabel("🗑 Poista linkitys").setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId("start").setLabel("▶ Käynnistä").setStyle(ButtonStyle.Success),
-      new ButtonBuilder().setCustomId("stop").setLabel("⏹ Pysäytä").setStyle(ButtonStyle.Danger),
-      new ButtonBuilder().setCustomId("settings").setLabel("⚙ Asetukset").setStyle(ButtonStyle.Secondary)
+      new ButtonBuilder().setCustomId("link").setLabel("🔑 Link Microsoft").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("unlink").setLabel("🗑 Unlink Account").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("start").setLabel("▶ Start").setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId("stop").setLabel("⏹ Stop").setStyle(ButtonStyle.Danger),
+      new ButtonBuilder().setCustomId("settings").setLabel("⚙ Settings").setStyle(ButtonStyle.Secondary)
     ),
     new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId("more").setLabel("➕ Lisää").setStyle(ButtonStyle.Secondary)
+      new ButtonBuilder().setCustomId("more").setLabel("➕ More").setStyle(ButtonStyle.Secondary)
     )
   ];
 }
 
-// ----------------- Slash-komennot -----------------
+// ----------------- Slash Commands -----------------
 client.once("ready", async () => {
-  console.log("🟢 Botti online:", client.user.tag);
-  const cmds = [new SlashCommandBuilder().setName("panel").setDescription("Avaa Bedrock AFK-paneeli")];
+  console.log("🟢 Bot is online as", client.user.tag);
+  
+  const cmds = [
+    new SlashCommandBuilder().setName("panel").setDescription("Open Bedrock AFK Control Panel"),
+    new SlashCommandBuilder()
+      .setName("admin")
+      .setDescription("Admin restricted commands")
+      .addSubcommand(sub => sub.setName("info").setDescription("View global bot statistics and running sessions"))
+      .addSubcommand(sub => 
+        sub.setName("stop-user")
+          .setDescription("Force stop a specific user's bot")
+          .addUserOption(opt => opt.setName("target").setDescription("The user to stop").setRequired(true))
+      )
+      .addSubcommand(sub => sub.setName("stop-all").setDescription("Force stop ALL currently running bots"))
+  ];
+
   await client.application.commands.set(cmds);
 });
 
-// ----------------- Microsoft linkitys -----------------
+// ----------------- Microsoft Link Flow -----------------
 async function linkMicrosoft(uid, interaction) {
   if (pendingLink.has(uid)) {
-    await interaction.editReply("⏳ Kirjautuminen on jo käynnissä.");
+    await interaction.editReply("⏳ Login is already in progress.");
     return;
   }
 
@@ -125,27 +141,27 @@ async function linkMicrosoft(uid, interaction) {
     },
     async (data) => {
       const uri = data.verification_uri_complete || data.verification_uri || "https://www.microsoft.com/link";
-      const code = data.user_code || "(ei koodia)";
+      const code = data.user_code || "(no code)";
       lastMsa.set(uid, { uri, code, at: Date.now() });
       codeShown = true;
 
-      const msg = `🔐 **Microsoft-kirjautuminen vaaditaan**\n\n👉 ${uri}\n\nKoodisi: \`${code}\`\n\nPalaa tänne kun olet kirjautunut.`;
+      const msg = `🔐 **Microsoft Login Required**\n\n👉 ${uri}\n\nYour code: \`${code}\`\n\nReturn here once you have signed in.`;
       await interaction.editReply({ 
         content: msg, 
-        components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setLabel("🌐 Avaa linkki").setStyle(ButtonStyle.Link).setURL(uri))]
+        components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setLabel("🌐 Open Link").setStyle(ButtonStyle.Link).setURL(uri))]
       }).catch(() => {});
     }
   );
 
   const p = (async () => {
     try {
-      if (!codeShown) await interaction.editReply("⏳ Pyydetään koodia…");
+      if (!codeShown) await interaction.editReply("⏳ Requesting login code…");
       await flow.getMsaToken();
       u.linked = true;
       save();
-      await interaction.followUp({ ephemeral: true, content: "✅ Microsoft-tili linkitetty!" }).catch(() => {});
+      await interaction.followUp({ ephemeral: true, content: "✅ Microsoft account linked successfully!" }).catch(() => {});
     } catch (e) {
-      await interaction.editReply(`❌ Virhe kirjautumisessa: ${String(e.message)}`).catch(() => {});
+      await interaction.editReply(`❌ Login failed: ${String(e.message)}`).catch(() => {});
     } finally {
       pendingLink.delete(uid);
     }
@@ -153,7 +169,7 @@ async function linkMicrosoft(uid, interaction) {
   pendingLink.set(uid, p);
 }
 
-// ----------------- Bedrock-sessio & Fysiikka -----------------
+// ----------------- Bedrock Session & Physics -----------------
 
 function cleanupSession(uid) {
   const s = sessions.get(uid);
@@ -176,7 +192,7 @@ function stopSession(uid) {
 function startSession(uid, interaction) {
   const u = getUser(uid);
   if (!u.server) {
-    if (interaction && !interaction.replied) interaction.editReply("⚠ Määritä asetukset ensin.");
+    if (interaction && !interaction.replied) interaction.editReply("⚠ Please configure settings first.").catch(() => {});
     return;
   }
 
@@ -209,73 +225,67 @@ function startSession(uid, interaction) {
     rejoinTimeout: null, 
     manualStop: false,
     isDisconnected: false,
-    // Fysiikkamuuttujat
+    packetCount: 0,
+    // Physics State
     pos: { x: 0, y: 0, z: 0 },
     vel: { x: 0, y: 0, z: 0 },
     yaw: 0,
     pitch: 0,
-    isMoving: false
+    isMoving: false,
+    serverInfo: { ip, port }
   };
   sessions.set(uid, session);
+
+  // Track packets for /admin info
+  mc.on('packet', () => session.packetCount++);
 
   session.timeout = setTimeout(() => {
     if (sessions.has(uid) && !session.isDisconnected) {
       cleanupSession(uid);
-      if (interaction) interaction.editReply("❌ Yhteyden aikakatkaisu.").catch(() => {});
+      if (interaction) interaction.editReply("❌ Connection timed out.").catch(() => {});
     }
   }, 47000);
 
   mc.on("spawn", () => {
     clearTimeout(session.timeout);
-    if (interaction) interaction.editReply(`🟢 Bot online: **${ip}:${port}**. Realistinen fysiikka käytössä.`).catch(() => {});
+    if (interaction) interaction.editReply(`🟢 Bot is online on **${ip}:${port}**. Realistic physics active.`).catch(() => {});
 
-    // Alustetaan sijainti spawniin
     if (mc.entity?.position) {
       session.pos = { ...mc.entity.position };
     }
 
-    // --- REALISTINEN FYSIIKKAMOOTTORI ---
-    // Minecraft tick on 50ms (20 TPS)
     session.physicsLoop = setInterval(() => {
       if (!mc.entityId) return;
 
-      const friction = 0.91; // Normaali maan kitka
-      const acceleration = 0.08; // Kävelyn kiihtyvyys per tick
+      const friction = 0.91;
+      const acceleration = 0.08;
       
-      // Päätetään satunnaisesti liikkumisesta (simuloidaan näppäinpainalluksia)
       const now = Date.now();
       if (!session.nextActionTime || now > session.nextActionTime) {
         session.isMoving = !session.isMoving;
-        // Liikutaan 2-5 sekuntia, sitten huilataan 15-30 sekuntia
         session.nextActionTime = now + (session.isMoving ? 3000 : 20000 + Math.random() * 10000);
         
         if (session.isMoving) {
-          // Valitaan satunnainen suunta (eteen tai taakse suhteessa yawiin)
           session.moveDir = Math.random() > 0.5 ? 1 : -1;
-          session.yaw = Math.random() * 360; // Käänny satunnaiseen suuntaan
+          session.yaw = Math.random() * 360; 
         }
       }
 
-      // Jos liikkeessä, lisää kiihtyvyyttä nopeuteen
       if (session.isMoving) {
         const rad = (session.yaw + 90) * (Math.PI / 180);
         session.vel.x += Math.cos(rad) * acceleration * session.moveDir;
         session.vel.z += Math.sin(rad) * acceleration * session.moveDir;
       }
 
-      // Käytä kitkaa nopeuteen
       session.vel.x *= friction;
       session.vel.z *= friction;
 
-      // Jos nopeus on hyvin pieni, nollaa se
       if (Math.abs(session.vel.x) < 0.001) session.vel.x = 0;
       if (Math.abs(session.vel.z) < 0.001) session.vel.z = 0;
 
-      // Päivitä sijainti nopeuden perusteella
       session.pos.x += session.vel.x;
       session.pos.z += session.vel.z;
 
-      // Lähetä liike-paketti vain jos on liikettä tai kääntymistä
       if (session.vel.x !== 0 || session.vel.z !== 0 || session.isMoving) {
         try {
           mc.write("move_player", {
@@ -298,9 +308,8 @@ function startSession(uid, interaction) {
     session.isDisconnected = true;
     if (session.physicsLoop) clearInterval(session.physicsLoop);
     
-    // --- AUTOMAATTINEN REJOIN (2 min) ---
     if (!session.manualStop) {
-      console.log(`Botti potkittiin (${uid}). Yritetään uudelleen 2min päästä...`);
+      console.log(`Bot disconnected (${uid}). Rejoining in 2 minutes...`);
       session.rejoinTimeout = setTimeout(() => {
         if (!session.manualStop) startSession(uid, interaction);
       }, 120000);
@@ -311,11 +320,11 @@ function startSession(uid, interaction) {
 
   mc.on("error", (e) => {
     session.isDisconnected = true;
-    console.error("MC Error:", e);
+    console.error("MC Protocol Error:", e);
   });
 }
 
-// ----------------- Vuorovaikutus -----------------
+// ----------------- Interactions -----------------
 client.on(Events.InteractionCreate, async (i) => {
   try {
     const blocked = denyIfWrongGuild(i);
@@ -323,8 +332,54 @@ client.on(Events.InteractionCreate, async (i) => {
 
     const uid = i.user.id;
 
-    if (i.isChatInputCommand() && i.commandName === "panel") {
-      return i.reply({ content: "🎛 **Bedrock AFK-ohjauspaneeli**", components: panelRow() });
+    if (i.isChatInputCommand()) {
+      if (i.commandName === "panel") {
+        return i.reply({ content: "🎛 **Bedrock AFK Control Panel**", components: panelRow() });
+      }
+
+      // ADMIN COMMANDS
+      if (i.commandName === "admin") {
+        if (i.channelId !== ADMIN_CHANNEL_ID) {
+          return i.reply({ ephemeral: true, content: "❌ This command can only be used in the designated admin channel." });
+        }
+
+        const sub = i.options.getSubcommand();
+
+        if (sub === "info") {
+          const usedMem = process.memoryUsage().rss / 1024 / 1024;
+          const activeSessions = sessions.size;
+          
+          let sessionText = "";
+          sessions.forEach((s, userId) => {
+            sessionText += `👤 <@${userId}>\n📍 IP: \`${s.serverInfo.ip}:${s.serverInfo.port}\`\n📦 Pkts: \`${s.packetCount}\`\n⚡ Status: \`${s.isDisconnected ? "Retrying..." : "Online"}\`\n\n`;
+          });
+
+          const embed = new EmbedBuilder()
+            .setTitle("🤖 Global Bot Status")
+            .setColor(ButtonStyle.Secondary)
+            .addFields(
+              { name: "🧠 RAM Usage", value: `\`${usedMem.toFixed(2)} MB\``, inline: true },
+              { name: "🎮 Active Bots", value: `\`${activeSessions}\``, inline: true },
+              { name: "🕒 Uptime", value: `<t:${Math.floor(client.readyTimestamp / 1000)}:R>`, inline: true }
+            )
+            .setDescription(sessionText || "No active sessions.")
+            .setTimestamp();
+
+          return i.reply({ embeds: [embed] });
+        }
+
+        if (sub === "stop-user") {
+          const target = i.options.getUser("target");
+          const ok = stopSession(target.id);
+          return i.reply({ content: ok ? `✅ Force stopped bot for <@${target.id}>.` : `❌ User <@${target.id}> has no active bot.` });
+        }
+
+        if (sub === "stop-all") {
+          const count = sessions.size;
+          sessions.forEach((_, userId) => stopSession(userId));
+          return i.reply({ content: `⏹ Force stopped **${count}** total bots. All re-joins disabled.` });
+        }
+      }
     }
 
     if (i.isButton()) {
@@ -334,18 +389,18 @@ client.on(Events.InteractionCreate, async (i) => {
       }
       if (i.customId === "start") {
         await i.deferReply({ ephemeral: true });
-        await i.editReply("⏳ Muodostetaan yhteyttä fysiikkamoottorilla…");
+        await i.editReply("⏳ Connecting with physics engine enabled…");
         return startSession(uid, i);
       }
       if (i.customId === "stop") {
         stopSession(uid);
-        return i.reply({ ephemeral: true, content: "⏹ Botti pysäytetty ja automaattinen uudelleenyhdistys peruttu." });
+        return i.reply({ ephemeral: true, content: "⏹ Bot stopped. Auto-rejoin disabled." });
       }
       if (i.customId === "settings") {
         const u = getUser(uid);
-        const modal = new ModalBuilder().setCustomId("settings_modal").setTitle("⚙ Bedrock-asetukset");
-        const ip = new TextInputBuilder().setCustomId("ip").setLabel("Palvelimen IP").setStyle(TextInputStyle.Short).setValue(u.server?.ip || "");
-        const port = new TextInputBuilder().setCustomId("port").setLabel("Portti").setStyle(TextInputStyle.Short).setValue(String(u.server?.port || 19132));
+        const modal = new ModalBuilder().setCustomId("settings_modal").setTitle("⚙ Bedrock Settings");
+        const ip = new TextInputBuilder().setCustomId("ip").setLabel("Server IP").setStyle(TextInputStyle.Short).setValue(u.server?.ip || "");
+        const port = new TextInputBuilder().setCustomId("port").setLabel("Port").setStyle(TextInputStyle.Short).setValue(String(u.server?.port || 19132));
         modal.addComponents(new ActionRowBuilder().addComponents(ip), new ActionRowBuilder().addComponents(port));
         return i.showModal(modal);
       }
@@ -357,7 +412,7 @@ client.on(Events.InteractionCreate, async (i) => {
       const u = getUser(uid);
       u.server = { ip, port };
       save();
-      return i.reply({ ephemeral: true, content: `Asetukset tallennettu: ${ip}:${port}` });
+      return i.reply({ ephemeral: true, content: `Settings saved: ${ip}:${port}` });
     }
 
   } catch (e) {
