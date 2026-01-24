@@ -1,3 +1,8 @@
+/**
+ * Bedrock AFK Bot - Professional Edition
+ * Integrated with LootLabs Reward Wall & Divine Physics v4
+ */
+
 const {
   Client,
   GatewayIntentBits,
@@ -16,16 +21,19 @@ const bedrock = require("bedrock-protocol");
 const { Authflow, Titles } = require("prismarine-auth");
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
+const axios = require("axios");
 
 // ----------------- Configuration -----------------
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
-if (!DISCORD_TOKEN) {
-  console.error("❌ DISCORD_TOKEN missing from environment variables");
-  process.exit(1);
-}
-
 const ALLOWED_GUILD_ID = "1462335230345089254";
 const ADMIN_CHANNEL_ID = "1464615993320935447";
+
+// ----------------- LootLabs Integration -----------------
+const LOOTLABS_API_KEY = "33e661bfba65b1587c3c41d39dbdee9f2fe0a3f8ad624240c9289bed0c22c2bd";
+// Replace this with your actual LootLabs link that redirects to your site/instructions
+const LOOTLABS_BASE_LINK = "https://lootlabs.com/your-specific-link"; 
+const AD_COOLDOWN_MS = 2 * 24 * 60 * 60 * 1000; // 48 hours
 
 // ----------------- Storage -----------------
 const DATA = path.join(__dirname, "data");
@@ -43,6 +51,7 @@ function save() {
 function getUser(uid) {
   if (!users[uid]) users[uid] = {};
   if (!users[uid].connectionType) users[uid].connectionType = "online";
+  if (!users[uid].lastAdTime) users[uid].lastAdTime = 0;
   return users[uid];
 }
 
@@ -52,17 +61,14 @@ function getUserAuthDir(uid) {
   return dir;
 }
 
-// ----------------- Runtime -----------------
+// ----------------- Runtime State -----------------
 const sessions = new Map();
 const pendingLink = new Map();
-const lastMsa = new Map();
-
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
-// ----------------- Physics Helpers -----------------
 const lerp = (start, end, amt) => (1 - amt) * start + amt * end;
 
-// ----------------- UI Helpers -----------------
+// ----------------- UI Builders -----------------
 function panelRow() {
   return [
     new ActionRowBuilder().addComponents(
@@ -75,197 +81,183 @@ function panelRow() {
   ];
 }
 
-// ----------------- Microsoft Link Logic -----------------
+// ----------------- Microsoft Auth Flow -----------------
 async function linkMicrosoft(uid, interaction) {
-  if (pendingLink.has(uid)) {
-    await interaction.editReply("⏳ Login already in progress. Check the previous code.").catch(() => {});
-    return;
-  }
-
+  if (pendingLink.has(uid)) return interaction.editReply("⏳ Login already in progress. Check your previous code.");
   const authDir = getUserAuthDir(uid);
   const u = getUser(uid);
-  let codeShown = false;
+  
+  const flow = new Authflow(uid, authDir, {
+    flow: "live",
+    authTitle: Titles.MinecraftNintendoSwitch,
+    deviceType: "Nintendo"
+  }, async (data) => {
+    const uri = data.verification_uri_complete || data.verification_uri;
+    const code = data.user_code;
+    await interaction.editReply({
+      content: `🔐 **Login Required**\nURL: ${uri}\nCode: \`${code}\``,
+      components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setLabel("Open Link").setStyle(ButtonStyle.Link).setURL(uri))]
+    }).catch(() => {});
+  });
 
-  const flow = new Authflow(
-    uid,
-    authDir,
-    {
-      flow: "live",
-      authTitle: Titles?.MinecraftNintendoSwitch || "Bedrock AFK Bot",
-      deviceType: "Nintendo"
-    },
-    async (data) => {
-      const uri = data.verification_uri_complete || data.verification_uri || "https://www.microsoft.com/link";
-      const code = data.user_code || "(no code)";
-      lastMsa.set(uid, { uri, code, at: Date.now() });
-      codeShown = true;
-
-      const msg = 
-        `🔐 **Microsoft Login Required**\n\n` +
-        `1. Go to: **${uri}**\n` +
-        `2. Enter Code: \`${code}\`\n\n` +
-        `⚠ Use a dedicated AFK account. This message will update when done.`;
-
-      await interaction.editReply({ 
-        content: msg, 
-        components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setLabel("🌐 Open Link").setStyle(ButtonStyle.Link).setURL(uri))]
-      }).catch(() => {});
-    }
-  );
-
-  const p = (async () => {
+  const promise = (async () => {
     try {
-      if (!codeShown) await interaction.editReply("⏳ Requesting Microsoft login code…").catch(() => {});
       await flow.getMsaToken();
       u.linked = true;
       save();
-      await interaction.followUp({ ephemeral: true, content: "✅ Microsoft account linked successfully!" }).catch(() => {});
+      await interaction.followUp({ ephemeral: true, content: "✅ Microsoft account linked successfully! 🥳" });
     } catch (e) {
-      await interaction.editReply(`❌ Login failed: ${String(e.message)}`).catch(() => {});
+      await interaction.editReply(`❌ Login failed: ${e.message}`);
     } finally {
       pendingLink.delete(uid);
     }
   })();
-
-  pendingLink.set(uid, p);
+  pendingLink.set(uid, promise);
 }
 
-// ----------------- Bot Session Logic -----------------
-function cleanupSession(uid) {
+// ----------------- LootLabs Verification -----------------
+async function checkLootLabsConversion(userId) {
+  try {
+    // API endpoint to check if user completed the link
+    const response = await axios.get(`https://lootlabs.gg/api/v1/conversions`, {
+      params: { 
+        api_key: LOOTLABS_API_KEY,
+        user_id: userId 
+      }
+    });
+    
+    // Check if there is a conversion recorded for this user recently
+    if (response.data && response.data.length > 0) {
+      return true;
+    }
+    return false;
+  } catch (err) {
+    console.error("LootLabs API Error:", err.message);
+    return false;
+  }
+}
+
+// ----------------- Minecraft Logic -----------------
+function stopSession(uid) {
   const s = sessions.get(uid);
-  if (!s) return;
+  if (!s) return false;
+  s.manualStop = true;
   if (s.physicsLoop) clearInterval(s.physicsLoop);
   if (s.rejoinTimeout) clearTimeout(s.rejoinTimeout);
   try { s.client.close(); } catch {}
   sessions.delete(uid);
-}
-
-function stopSession(uid) {
-  if (!sessions.has(uid)) return false;
-  const s = sessions.get(uid);
-  s.manualStop = true;
-  cleanupSession(uid);
   return true;
 }
 
-function startSession(uid, interaction) {
+/**
+ * Handles the actual connection logic after all checks (Ads/Settings) are passed
+ */
+function actualConnect(uid, interaction) {
   const u = getUser(uid);
-  if (!u.server) {
-    if (interaction && !interaction.replied) interaction.editReply("⚠ Configure settings first.").catch(() => {});
-    return;
-  }
-  if (sessions.has(uid) && !sessions.get(uid).isDisconnected) return;
+  interaction.editReply("⏳ Connecting... 🔌").catch(() => {});
 
-  const { ip, port } = u.server;
   const mc = bedrock.createClient({
-    host: ip,
-    port: port || 19132,
+    host: u.server.ip,
+    port: u.server.port || 19132,
     profilesFolder: getUserAuthDir(uid),
     username: uid,
     offline: u.connectionType === "offline",
-    connectTimeout: 45000
+    // Skin Fix to prevent being invisible
+    skinData: { 
+      DeviceOS: 11, 
+      DeviceId: crypto.randomUUID(), 
+      SkinId: "Standard_Steve", 
+      UIProfile: 0 
+    }
   });
 
   const session = {
     client: mc,
     manualStop: false,
-    isDisconnected: false,
     packetCount: 0,
-    serverInfo: { ip, port },
-    // Advanced Physics State
+    serverInfo: u.server,
+    // Physics v4 State
     pos: { x: 0, y: 0, z: 0 },
     vel: { x: 0, y: 0, z: 0 },
-    yaw: 0,
-    pitch: 0,
-    targetYaw: 0,
-    targetPitch: 0,
-    isMoving: false,
-    onGround: true,
-    tickCount: 0,
-    nextDecisionTick: 0
+    yaw: 0, pitch: 0, targetYaw: 0, targetPitch: 0,
+    isMoving: false, onGround: true, tick: 0, nextThink: 0
   };
   sessions.set(uid, session);
 
   mc.on('packet', () => session.packetCount++);
 
   mc.on("spawn", () => {
-    if (interaction) interaction.editReply(`🟢 **Bot** active on **${ip}:${port}**`).catch(() => {});
+    // Update status to connected
+    interaction.editReply(`🟢 Connected to **${u.server.ip}:${u.server.port || 19132}** 🎮`).catch(() => {});
     if (mc.entity?.position) session.pos = { ...mc.entity.position };
 
-    // --- DIVINE PHYSICS LOOP (20 TPS) ---
+    // --- DIVINE PHYSICS ENGINE v4 (20 TPS) ---
     session.physicsLoop = setInterval(() => {
       if (!mc.entityId) return;
-      session.tickCount++;
+      session.tick++;
 
-      // 1. Human Decision Logic
-      if (session.tickCount >= session.nextDecisionTick) {
-        const roll = Math.random();
-        if (roll < 0.3) { 
+      // Humanized Decision Making
+      if (session.tick >= session.nextThink) {
+        const r = Math.random();
+        if (r < 0.4) {
           session.isMoving = true;
-          session.targetYaw = (session.targetYaw + (Math.random() * 160 - 80)) % 360;
-          session.nextDecisionTick = session.tickCount + 80 + Math.random() * 120;
-        } else if (roll < 0.5) { 
+          session.targetYaw = (session.targetYaw + (Math.random() * 120 - 60)) % 360;
+          session.nextThink = session.tick + 70 + Math.random() * 100;
+        } else if (r < 0.6) {
           session.isMoving = false;
-          session.targetPitch = Math.random() * 40 - 20;
-          session.nextDecisionTick = session.tickCount + 100 + Math.random() * 200;
-        } else { 
-          session.targetYaw += Math.random() * 15 - 7.5;
-          session.nextDecisionTick = session.tickCount + 30 + Math.random() * 60;
+          session.targetPitch = Math.random() * 30 - 15;
+          session.nextThink = session.tick + 100 + Math.random() * 180;
+        } else {
+          session.targetYaw += Math.random() * 20 - 10;
+          session.nextThink = session.tick + 30 + Math.random() * 60;
         }
         
-        if (session.isMoving && Math.random() < 0.05 && session.onGround) {
+        // Random Jump Logic
+        if (session.isMoving && Math.random() < 0.06 && session.onGround) {
           session.vel.y = 0.42; 
           session.onGround = false;
         }
       }
 
-      // 2. Camera Smoothing
-      session.yaw = lerp(session.yaw, session.targetYaw, 0.15);
-      session.pitch = lerp(session.pitch, session.targetPitch, 0.1);
+      // Smooth Camera Rotation (Lerp)
+      session.yaw = lerp(session.yaw, session.targetYaw, 0.1);
+      session.pitch = lerp(session.pitch, session.targetPitch, 0.05);
 
-      // 3. Human Noise (Breathing & Jitter)
-      const breathing = Math.sin(session.tickCount * 0.05) * 0.4;
-      const jitter = (Math.random() - 0.5) * 0.1;
-      const finalPitch = session.pitch + breathing + jitter;
-
-      // 4. Locomotion & Forces
+      // Physics Calculation (Gravity & Friction)
       const friction = session.onGround ? 0.91 : 0.98;
-      const accel = session.onGround ? 0.1 : 0.02;
-
       if (session.isMoving) {
         const rad = (session.yaw + 90) * (Math.PI / 180);
-        session.vel.x += Math.cos(rad) * accel;
-        session.vel.z += Math.sin(rad) * accel;
+        session.vel.x += Math.cos(rad) * 0.085;
+        session.vel.z += Math.sin(rad) * 0.085;
       }
 
-      session.vel.y -= 0.08; // Gravity
-      session.vel.x *= friction;
-      session.vel.z *= friction;
+      session.vel.y -= 0.08; // Gravity constant
+      session.vel.x *= friction; 
+      session.vel.z *= friction; 
       session.vel.y *= 0.98;
 
-      session.pos.x += session.vel.x;
-      session.pos.y += session.vel.y;
+      session.pos.x += session.vel.x; 
+      session.pos.y += session.vel.y; 
       session.pos.z += session.vel.z;
 
-      // Simple Floor Collision
-      const floor = mc.entity?.position?.y || session.pos.y;
-      if (session.pos.y < floor - 0.1) {
-        session.pos.y = floor;
-        session.vel.y = 0;
+      // Simple ground check
+      const ground = mc.entity?.position?.y || session.pos.y;
+      if (session.pos.y < ground - 0.1) {
+        session.pos.y = ground; 
+        session.vel.y = 0; 
         session.onGround = true;
       }
 
-      // 5. Sync
       try {
         mc.write("move_player", {
-          runtime_id: mc.entityId,
-          position: session.pos,
-          pitch: finalPitch,
-          yaw: session.yaw,
-          head_yaw: session.yaw,
-          mode: 0,
+          runtime_id: mc.entityId, 
+          position: session.pos, 
+          pitch: session.pitch,
+          yaw: session.yaw, 
+          head_yaw: session.yaw, 
+          mode: 0, 
           on_ground: session.onGround,
-          ridden_runtime_id: 0,
+          ridden_runtime_id: 0, 
           teleport: false
         });
       } catch {}
@@ -273,123 +265,160 @@ function startSession(uid, interaction) {
   });
 
   mc.on("close", () => {
-    session.isDisconnected = true;
     if (session.physicsLoop) clearInterval(session.physicsLoop);
-    
-    // Auto-rejoin logic (2 minutes)
+    // Automatic rejoin after 2 minutes
     if (!session.manualStop) {
-      console.log(`[DISCONNECT] ${uid} - Rejoining in 120s...`);
+      console.log(`[REJOIN] Bot for ${uid} disconnected. Rejoining in 120s...`);
       session.rejoinTimeout = setTimeout(() => {
-        if (!session.manualStop) startSession(uid, interaction);
+        if (!session.manualStop) actualConnect(uid, interaction);
       }, 120000);
     } else {
-      cleanupSession(uid);
+      sessions.delete(uid);
     }
   });
 
   mc.on("error", (e) => {
-    console.error(`[MC ERROR] ${uid}:`, e);
-    session.isDisconnected = true;
+    interaction.editReply(`❌ Error: ${e.message}`).catch(() => {});
+    stopSession(uid);
   });
 }
 
-// ----------------- Interactions -----------------
+// ----------------- Interaction Logic -----------------
 client.on(Events.InteractionCreate, async (i) => {
   const uid = i.user.id;
-
-  if (i.guildId !== ALLOWED_GUILD_ID) {
-    return i.reply({ ephemeral: true, content: "⛔ Restricted access." }).catch(() => {});
-  }
+  if (i.guildId !== ALLOWED_GUILD_ID) return;
 
   if (i.isChatInputCommand()) {
     if (i.commandName === "panel") {
-      return i.reply({ content: "🎛 **Bedrock Manager**\nStatus: Online", components: panelRow() });
+      const embed = new EmbedBuilder()
+        .setTitle("🤖 AFK Bot Control Panel")
+        .setColor(0x5865F2)
+        .setDescription("Manage your Bedrock AFK bot session easily. ✨")
+        .setFooter({ text: "💰 Support AFKBot by completing the LootLabs wall!" });
+
+      return i.reply({ embeds: [embed], components: panelRow() });
     }
 
     if (i.commandName === "admin" && i.channelId === ADMIN_CHANNEL_ID) {
       const sub = i.options.getSubcommand();
-      
       if (sub === "info") {
         const mem = process.memoryUsage().rss / 1024 / 1024;
-        let stats = "";
-        sessions.forEach((s, id) => {
-          stats += `👤 <@${id}> | IP: \`${s.serverInfo.ip}\` | Pkts: \`${s.packetCount}\` | ${s.isDisconnected ? "REJOINING" : "LIVE"}\n`;
-        });
-
-        const embed = new EmbedBuilder()
-          .setTitle("🛠 Global System Stats")
-          .setColor(0x00FF00)
+        let s = ""; 
+        sessions.forEach((v, k) => s += `👤 <@${k}> | IP: ${v.serverInfo.ip} | Pkts: ${v.packetCount} | Status: ${v.isDisconnected ? "REJOINING" : "LIVE"}\n`);
+        
+        const emb = new EmbedBuilder().setTitle("🖥 System Admin Dashboard").setColor(0x00FF00)
           .addFields(
-            { name: "RAM", value: `\`${mem.toFixed(1)}MB\``, inline: true },
-            { name: "Active", value: `\`${sessions.size}\``, inline: true }
+            { name: "🧠 RAM", value: `${mem.toFixed(1)}MB`, inline: true }, 
+            { name: "🎮 Bots", value: `${sessions.size}`, inline: true }
           )
-          .setDescription(stats || "No sessions active.");
-        return i.reply({ embeds: [embed] });
+          .setDescription(s || "No bots currently running.");
+        return i.reply({ embeds: [emb] });
       }
-
       if (sub === "stop-all") {
-        const count = sessions.size;
         sessions.forEach((_, id) => stopSession(id));
-        return i.reply(`🛑 Terminated **${count}** sessions.`);
+        return i.reply("🛑 All active bots have been forced to stop.");
       }
     } else if (i.commandName === "admin") {
-      return i.reply({ ephemeral: true, content: "❌ Admins only. Use the correct channel." });
+      return i.reply({ ephemeral: true, content: "❌ Command restricted to the admin channel." });
     }
   }
 
   if (i.isButton()) {
-    if (i.customId === "link") {
-      await i.deferReply({ ephemeral: true });
-      return linkMicrosoft(uid, i);
-    }
+    if (i.customId === "link") { await i.deferReply({ ephemeral: true }); return linkMicrosoft(uid, i); }
     
     if (i.customId === "start") {
       await i.deferReply({ ephemeral: true });
-      startSession(uid, i);
+      const u = getUser(uid);
+
+      // Initial Checks
+      if (!u.server?.ip) return i.editReply("❌ Please configure the server in **Settings** first. ⚙");
+      if (u.connectionType === "online" && !u.linked) return i.editReply("❌ Please **Link Microsoft** account first. 🔑");
+      if (sessions.has(uid)) return i.editReply("❌ Bot is already running. 🏃");
+
+      // --- Reward Wall Check ---
+      const now = Date.now();
+      if (now - u.lastAdTime > AD_COOLDOWN_MS) {
+        const adEmbed = new EmbedBuilder()
+          .setTitle("📢 Ad Completion Required")
+          .setColor(0xFFA500)
+          .setDescription(
+            "**We are sorry but this is to keep AFKBot up!** 🥺\n\n" +
+            "Please complete the link wall to continue. This supports our hosting costs.\n\n" +
+            "**This will be prompted only once every 2 days.** 📅"
+          );
+
+        const adRow = new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setLabel("🔗 Open LootLabs Link").setStyle(ButtonStyle.Link).setURL(LOOTLABS_BASE_LINK + `?user_id=${uid}`),
+          new ButtonBuilder().setCustomId("verify_ad").setLabel("✅ I've Completed It").setStyle(ButtonStyle.Success)
+        );
+
+        return i.editReply({ embeds: [adEmbed], components: [adRow] });
+      }
+
+      // If ad is fresh, connect directly
+      return actualConnect(uid, i);
     }
-    
+
+    if (i.customId === "verify_ad") {
+      await i.deferReply({ ephemeral: true });
+      const success = await checkLootLabsConversion(uid);
+      
+      if (success) {
+        const u = getUser(uid);
+        u.lastAdTime = Date.now();
+        save();
+        await i.editReply("✅ Verification successful! Starting your bot... 🚀");
+        return actualConnect(uid, i);
+      } else {
+        return i.editReply("❌ **Completion not detected.** Make sure you finished the link wall. 🥺");
+      }
+    }
+
     if (i.customId === "stop") {
       const ok = stopSession(uid);
-      i.reply({ ephemeral: true, content: ok ? "⏹ Session stopped." : "❌ No active session." });
+      return i.reply({ ephemeral: true, content: ok ? "⏹ Bot stopped. Auto-rejoin disabled." : "❌ No bot running." });
     }
 
     if (i.customId === "unlink") {
       const u = getUser(uid);
       u.linked = false;
       save();
-      i.reply({ ephemeral: true, content: "🗑 Microsoft link removed." });
+      return i.reply({ ephemeral: true, content: "🗑 Microsoft account unlinked successfully." });
     }
 
     if (i.customId === "settings") {
       const u = getUser(uid);
-      const modal = new ModalBuilder().setCustomId("sets").setTitle("Server Config");
-      const ip = new TextInputBuilder().setCustomId("ip").setLabel("IP").setStyle(TextInputStyle.Short).setValue(u.server?.ip || "");
-      const port = new TextInputBuilder().setCustomId("port").setLabel("Port").setStyle(TextInputStyle.Short).setValue(String(u.server?.port || 19132));
-      modal.addComponents(new ActionRowBuilder().addComponents(ip), new ActionRowBuilder().addComponents(port));
-      i.showModal(modal);
+      const mod = new ModalBuilder().setCustomId("sets").setTitle("Server Configuration");
+      const ip = new TextInputBuilder().setCustomId("ip").setLabel("Server IP").setStyle(TextInputStyle.Short).setValue(u.server?.ip || "");
+      const port = new TextInputBuilder().setCustomId("port").setLabel("Port (e.g. 19132)").setStyle(TextInputStyle.Short).setValue(String(u.server?.port || 19132));
+      mod.addComponents(new ActionRowBuilder().addComponents(ip), new ActionRowBuilder().addComponents(port));
+      return i.showModal(mod);
     }
   }
 
   if (i.isModalSubmit() && i.customId === "sets") {
     const u = getUser(uid);
-    u.server = { ip: i.fields.getTextInputValue("ip"), port: parseInt(i.fields.getTextInputValue("port")) };
+    u.server = { 
+      ip: i.fields.getTextInputValue("ip").trim(), 
+      port: parseInt(i.fields.getTextInputValue("port").trim()) || 19132 
+    };
     save();
-    i.reply({ ephemeral: true, content: "✅ Settings saved." });
+    return i.reply({ ephemeral: true, content: "✅ Settings saved! 💾" });
   }
 });
 
-// ----------------- Initialization -----------------
+// ----------------- Startup -----------------
 client.once("ready", () => {
-  console.log(`✅ System Online: ${client.user.tag}`);
   client.application.commands.set([
     new SlashCommandBuilder().setName("panel").setDescription("User AFK Panel"),
     new SlashCommandBuilder().setName("admin").setDescription("Global Admin Control")
-      .addSubcommand(s => s.setName("info").setDescription("System stats"))
+      .addSubcommand(s => s.setName("info").setDescription("Global stats & RAM"))
       .addSubcommand(s => s.setName("stop-all").setDescription("Kill all bots"))
   ]);
+  console.log(`✅ AFKBot Online as ${client.user.tag}`);
 });
 
-process.on("unhandledRejection", e => console.error("Unhandled:", e));
+process.on("unhandledRejection", e => console.error("Unhandled rejection:", e));
 
 client.login(DISCORD_TOKEN);
 
