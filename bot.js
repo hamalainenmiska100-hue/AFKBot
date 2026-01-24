@@ -9,7 +9,6 @@ const {
   ModalBuilder,
   TextInputBuilder,
   TextInputStyle,
-  StringSelectMenuBuilder,
   EmbedBuilder
 } = require("discord.js");
 
@@ -92,9 +91,6 @@ function panelRow() {
       new ButtonBuilder().setCustomId("start").setLabel("▶ Start").setStyle(ButtonStyle.Success),
       new ButtonBuilder().setCustomId("stop").setLabel("⏹ Stop").setStyle(ButtonStyle.Danger),
       new ButtonBuilder().setCustomId("settings").setLabel("⚙ Settings").setStyle(ButtonStyle.Secondary)
-    ),
-    new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId("more").setLabel("➕ More").setStyle(ButtonStyle.Secondary)
     )
   ];
 }
@@ -236,7 +232,7 @@ function startSession(uid, interaction) {
   };
   sessions.set(uid, session);
 
-  // Track packets for /admin info
+  // Track packets
   mc.on('packet', () => session.packetCount++);
 
   session.timeout = setTimeout(() => {
@@ -308,6 +304,7 @@ function startSession(uid, interaction) {
     session.isDisconnected = true;
     if (session.physicsLoop) clearInterval(session.physicsLoop);
     
+    // --- AUTO REJOIN (2 Minutes) ---
     if (!session.manualStop) {
       console.log(`Bot disconnected (${uid}). Rejoining in 2 minutes...`);
       session.rejoinTimeout = setTimeout(() => {
@@ -337,10 +334,9 @@ client.on(Events.InteractionCreate, async (i) => {
         return i.reply({ content: "🎛 **Bedrock AFK Control Panel**", components: panelRow() });
       }
 
-      // ADMIN COMMANDS
       if (i.commandName === "admin") {
         if (i.channelId !== ADMIN_CHANNEL_ID) {
-          return i.reply({ ephemeral: true, content: "❌ This command can only be used in the designated admin channel." });
+          return i.reply({ ephemeral: true, content: "❌ This command can only be used in the admin channel." });
         }
 
         const sub = i.options.getSubcommand();
@@ -356,7 +352,7 @@ client.on(Events.InteractionCreate, async (i) => {
 
           const embed = new EmbedBuilder()
             .setTitle("🤖 Global Bot Status")
-            .setColor(ButtonStyle.Secondary)
+            .setColor(0x5865F2)
             .addFields(
               { name: "🧠 RAM Usage", value: `\`${usedMem.toFixed(2)} MB\``, inline: true },
               { name: "🎮 Active Bots", value: `\`${activeSessions}\``, inline: true },
@@ -371,13 +367,13 @@ client.on(Events.InteractionCreate, async (i) => {
         if (sub === "stop-user") {
           const target = i.options.getUser("target");
           const ok = stopSession(target.id);
-          return i.reply({ content: ok ? `✅ Force stopped bot for <@${target.id}>.` : `❌ User <@${target.id}> has no active bot.` });
+          return i.reply({ content: ok ? `✅ Force stopped bot for <@${target.id}>.` : `❌ No active bot for <@${target.id}>.` });
         }
 
         if (sub === "stop-all") {
           const count = sessions.size;
           sessions.forEach((_, userId) => stopSession(userId));
-          return i.reply({ content: `⏹ Force stopped **${count}** total bots. All re-joins disabled.` });
+          return i.reply({ content: `⏹ Force stopped **${count}** bots.` });
         }
       }
     }
@@ -389,7 +385,7 @@ client.on(Events.InteractionCreate, async (i) => {
       }
       if (i.customId === "start") {
         await i.deferReply({ ephemeral: true });
-        await i.editReply("⏳ Connecting with physics engine enabled…");
+        await i.editReply("⏳ Connecting with physics engine…");
         return startSession(uid, i);
       }
       if (i.customId === "stop") {
