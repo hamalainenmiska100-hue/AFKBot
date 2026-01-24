@@ -1,0 +1,8 @@
+app = "afkbot"
+primary_region = "ams"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[processes]
+  app = "node bot.js"
