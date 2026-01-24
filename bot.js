@@ -18,70 +18,64 @@ const { Authflow, Titles } = require("prismarine-auth");
 const fs = require("fs");
 const path = require("path");
 
-// ----------------------------------------------------------------
-// PRODUCTION CONFIGURATION
-// ----------------------------------------------------------------
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
+if (!DISCORD_TOKEN) {
+  console.error("❌ DISCORD_TOKEN missing");
+  process.exit(1);
+}
+
+// ----------------- Production Config -----------------
 const ALLOWED_GUILD_ID = "1462335230345089254";
 const ADMIN_ID = "1144987924123881564";
 const LOG_CHANNEL_ID = "1464615030111731753";
 const ADMIN_CHANNEL_ID = "1464615993320935447";
-const CONNECTION_TIMEOUT = 25000; 
+const RECONNECT_DELAY = 30000; // 30 seconds as requested
 
-if (!DISCORD_TOKEN) {
-  console.error("❌ CRITICAL: DISCORD_TOKEN is missing.");
-  process.exit(1);
-}
+// ----------------- Storage -----------------
+const DATA = path.join(__dirname, "data");
+const AUTH_ROOT = path.join(DATA, "auth");
+const STORE = path.join(DATA, "users.json");
 
-// ----------------------------------------------------------------
-// DATABASE & DIRECTORIES
-// ----------------------------------------------------------------
-const DATA_DIR = path.join(__dirname, "data");
-const AUTH_DIR = path.join(DATA_DIR, "auth");
-const STORE_FILE = path.join(DATA_DIR, "users.json");
+if (!fs.existsSync(DATA)) fs.mkdirSync(DATA);
+if (!fs.existsSync(AUTH_ROOT)) fs.mkdirSync(AUTH_ROOT, { recursive: true });
 
-if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR);
-if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true });
-
-let users = {};
-if (fs.existsSync(STORE_FILE)) {
-  try {
-    users = JSON.parse(fs.readFileSync(STORE_FILE, "utf8"));
-  } catch (e) {
-    users = {};
-  }
-}
-
+let users = fs.existsSync(STORE) ? JSON.parse(fs.readFileSync(STORE, "utf8")) : {};
 function save() {
-  fs.writeFileSync(STORE_FILE, JSON.stringify(users, null, 2));
+  fs.writeFileSync(STORE, JSON.stringify(users, null, 2));
 }
 
 function getUser(uid) {
-  if (!users[uid]) {
-    users[uid] = {
-      connectionType: "online",
-      bedrockVersion: "auto",
-      offlineUsername: `AFK_${uid.slice(-4)}`,
-      active: false,
-      server: null
-    };
-  }
+  if (!users[uid]) users[uid] = {};
+  if (!users[uid].delayMs) users[uid].delayMs = 5000;
+  if (!users[uid].connectionType) users[uid].connectionType = "online";
+  if (!users[uid].bedrockVersion) users[uid].bedrockVersion = "auto";
+  if (!users[uid].offlineUsername) users[uid].offlineUsername = `AFK_${uid.slice(-4)}`;
+  if (users[uid].active === undefined) users[uid].active = false;
   return users[uid];
 }
 
-function getAuthPath(uid) {
-  const p = path.join(AUTH_DIR, uid);
-  if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive: true });
-  return p;
+function getUserAuthDir(uid) {
+  const dir = path.join(AUTH_ROOT, uid);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  return dir;
 }
 
-// ----------------------------------------------------------------
-// RUNTIME STATE
-// ----------------------------------------------------------------
-const sessions = new Map();
-const activeLinks = new Map();
-let adminPanel = null;
+function unlinkMicrosoft(uid) {
+  const dir = getUserAuthDir(uid);
+  try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
+  const u = getUser(uid);
+  u.linked = false;
+  u.active = false;
+  save();
+}
 
+// ----------------- Runtime -----------------
+const sessions = new Map();
+const pendingLink = new Map();
+const lastMsa = new Map();
+let adminPanelMessage = null;
+
+// ----------------- Discord client -----------------
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -90,42 +84,231 @@ const client = new Client({
   ]
 });
 
-// ----------------------------------------------------------------
-// PRODUCTION LOGGING
-// ----------------------------------------------------------------
-
-async function log(desc, color = "#5865F2") {
+// ----------------- Production Logging -----------------
+async function logToDiscord(message, color = "#5865F2") {
   try {
-    const ch = await client.channels.fetch(LOG_CHANNEL_ID);
-    if (ch && ch.isTextBased()) {
-      const embed = new EmbedBuilder().setColor(color).setDescription(desc).setTimestamp();
-      await ch.send({ embeds: [embed] });
+    const channel = await client.channels.fetch(LOG_CHANNEL_ID);
+    if (channel) {
+      const embed = new EmbedBuilder()
+        .setColor(color)
+        .setDescription(message)
+        .setTimestamp();
+      await channel.send({ embeds: [embed] });
     }
   } catch (e) {}
 }
 
-async function dm(uid, msg) {
+async function sendPrivateDM(uid, message) {
   try {
-    const u = await client.users.fetch(uid);
-    if (u) await u.send(msg);
+    const user = await client.users.fetch(uid);
+    if (user) await user.send(message);
   } catch (e) {}
 }
 
-function checkGuild(i) {
+function denyIfWrongGuild(i) {
   if (!i.inGuild() || i.guildId !== ALLOWED_GUILD_ID) {
-    const txt = "Bot restricted to production guild ⛔";
-    if (i.deferred || i.replied) i.editReply(txt).catch(() => {});
-    else i.reply({ ephemeral: true, content: txt }).catch(() => {});
-    return false;
+    const msg = "This bot cannot be used in this server ⛔️";
+    if (i.deferred) return i.editReply(msg).catch(() => {});
+    if (i.replied) return i.followUp({ ephemeral: true, content: msg }).catch(() => {});
+    return i.reply({ ephemeral: true, content: msg }).catch(() => {});
   }
-  return true;
+  return null;
 }
 
-// ----------------------------------------------------------------
-// CORE SESSION LOGIC & RAM OPTIMIZATION
-// ----------------------------------------------------------------
+// ----------------- UI helpers -----------------
+function panelRow() {
+  return [
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId("link").setLabel("🔑 Link Microsoft").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("unlink").setLabel("🗑 Unlink Microsoft").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("start").setLabel("▶ Start").setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId("stop").setLabel("⏹ Stop").setStyle(ButtonStyle.Danger),
+      new ButtonBuilder().setCustomId("settings").setLabel("⚙ Settings").setStyle(ButtonStyle.Secondary)
+    ),
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId("more").setLabel("➕ More").setStyle(ButtonStyle.Secondary)
+    )
+  ];
+}
 
-function stop(uid, manual = true) {
+function adminPanelComponents() {
+  const rows = [
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId("admin_refresh").setLabel("Refresh Stats").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("admin_stop_all").setLabel("Force Stop All").setStyle(ButtonStyle.Danger)
+    )
+  ];
+
+  if (sessions.size > 0) {
+    const options = Array.from(sessions.keys()).slice(0, 25).map(uid => ({
+      label: `User: ${uid}`,
+      description: sessions.get(uid).connected ? "Online" : "Connecting...",
+      value: uid
+    }));
+    rows.push(new ActionRowBuilder().addComponents(
+      new StringSelectMenuBuilder().setCustomId("admin_force_stop").setPlaceholder("Force stop a specific bot").addOptions(options)
+    ));
+  }
+  return rows;
+}
+
+function msaComponents(uri) {
+  return [
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setLabel("🌐 Open link").setStyle(ButtonStyle.Link).setURL(uri)
+    )
+  ];
+}
+
+function versionRow(current = "auto") {
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId("set_version")
+    .setPlaceholder("🌐 Bedrock Version")
+    .addOptions(
+      { label: "Auto", value: "auto", default: current === "auto" },
+      { label: "1.21.x", value: "1.21.x", default: current === "1.21.x" },
+      { label: "1.20.x", value: "1.20.x", default: current === "1.20.x" },
+      { label: "1.19.x", value: "1.19.x", default: current === "1.19.x" }
+    );
+  return new ActionRowBuilder().addComponents(menu);
+}
+
+function connRow(current = "online") {
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId("set_conn")
+    .setPlaceholder("🔌 Connection Type")
+    .addOptions(
+      { label: "Online (Microsoft)", value: "online", default: current === "online" },
+      { label: "Offline (Cracked)", value: "offline", default: current === "offline" }
+    );
+  return new ActionRowBuilder().addComponents(menu);
+}
+
+// ----------------- Admin Analytics -----------------
+function getAdminStats() {
+  const mem = process.memoryUsage();
+  const uptime = process.uptime();
+  const embed = new EmbedBuilder()
+    .setTitle("🚀 Production Admin Dashboard")
+    .setColor("#2F3136")
+    .addFields(
+      { name: "💻 System", value: `**RAM:** ${(mem.rss / 1024 / 1024).toFixed(2)} MB\n**Uptime:** ${Math.floor(uptime/3600)}h ${Math.floor((uptime%3600)/60)}m`, inline: true },
+      { name: "🤖 Active Bots", value: `${sessions.size} sessions active`, inline: true }
+    )
+    .setTimestamp();
+
+  if (sessions.size > 0) {
+    let list = "";
+    for (const [uid, s] of sessions) {
+      list += `<@${uid}>: ${s.connected ? "🟢" : "🟠"} (${s.pkts || 0} pkts)\n`;
+    }
+    embed.addFields({ name: "Session List", value: list.slice(0, 1024) });
+  }
+  return embed;
+}
+
+// ----------------- Slash commands -----------------
+client.once("ready", async () => {
+  console.log("🟢 Online as", client.user.tag);
+
+  const cmds = [
+    new SlashCommandBuilder().setName("panel").setDescription("Open Bedrock AFK panel"),
+    new SlashCommandBuilder().setName("admin").setDescription("Admin analytics and control")
+  ];
+
+  await client.application.commands.set(cmds);
+
+  // --- AUTO-RESTORE (Persistence) ---
+  const activeIds = Object.keys(users).filter(id => users[id].active === true);
+  if (activeUserIds.length > 0) {
+    logToDiscord(`♻️ **Auto-Restore**: Deployment finished. Reconnecting ${activeIds.length} bots...`);
+    activeIds.forEach((id, idx) => {
+      setTimeout(() => startSession(id), idx * 3000);
+    });
+  }
+
+  // Admin Auto-Refresh
+  setInterval(async () => {
+    if (adminPanelMessage) {
+      try { await adminPanelMessage.edit({ embeds: [getAdminStats()], components: adminPanelComponents() }); }
+      catch (e) { adminPanelMessage = null; }
+    }
+  }, 30000);
+});
+
+// ----------------- Microsoft link -----------------
+async function linkMicrosoft(uid, interaction) {
+  if (pendingLink.has(uid)) {
+    await interaction.editReply("⏳ Login already in progress. Use the last code.");
+    return;
+  }
+
+  // FIXED: Pre-reply to prevent Discord timeout
+  await interaction.editReply("⏳ Requesting login from Microsoft... Please wait.");
+
+  const authDir = getUserAuthDir(uid);
+  const u = getUser(uid);
+  let codeShown = false;
+
+  try {
+    const flow = new Authflow(
+      uid,
+      authDir,
+      {
+        flow: "live",
+        authTitle: Titles?.MinecraftNintendoSwitch || "Bedrock AFK Bot",
+        deviceType: "Nintendo"
+      },
+      async (data) => {
+        const uri = data.verification_uri_complete || data.verification_uri || "https://www.microsoft.com/link";
+        const code = data.user_code || "(no code)";
+        lastMsa.set(uid, { uri, code, at: Date.now() });
+        codeShown = true;
+
+        const embed = new EmbedBuilder()
+          .setTitle("🔐 Microsoft login required")
+          .setDescription(`👉 **[Click Here to Login](${uri})**\n\nYour code: \`${code}\`\n\n⚠ **IMPORTANT:** Use a *second* account.`)
+          .setColor("#5865F2");
+
+        await interaction.editReply({ content: null, embeds: [embed], components: msaComponents(uri) }).catch(() => {});
+      }
+    );
+
+    const p = (async () => {
+      try {
+        await flow.getMsaToken();
+        u.linked = true;
+        save();
+        await interaction.followUp({ ephemeral: true, content: "✅ Microsoft account linked!" }).catch(() => {});
+        logToDiscord(`🔑 User <@${uid}> successfully linked.`);
+      } catch (e) {
+        await interaction.followUp({ ephemeral: true, content: `❌ Microsoft login failed: ${e.message}` }).catch(() => {});
+      } finally {
+        pendingLink.delete(uid);
+      }
+    })();
+    pendingLink.set(uid, p);
+  } catch (e) {
+    await interaction.editReply(`❌ Failed to init Microsoft flow: ${e.message}`);
+  }
+}
+
+// ----------------- Bedrock session -----------------
+function cleanupSession(uid) {
+  const s = sessions.get(uid);
+  if (!s) return;
+  if (s.timeout) clearTimeout(s.timeout);
+  if (s.reconnectTimer) clearTimeout(s.reconnectTimer);
+  if (s.afkInterval) clearInterval(s.afkInterval);
+  try { 
+    s.client.removeAllListeners();
+    s.client.close(); 
+  } catch {}
+  sessions.delete(uid);
+  if (global.gc) global.gc(); // Clean RAM
+}
+
+function stopSession(uid, manual = true) {
   const s = sessions.get(uid);
   if (manual) {
     const u = getUser(uid);
@@ -134,47 +317,32 @@ function stop(uid, manual = true) {
   }
   if (!s) return false;
   if (manual) s.manualStop = true;
-  
-  if (s.timeout) clearTimeout(s.timeout);
-  if (s.reconnect) clearTimeout(s.reconnect);
-  if (s.afk) clearInterval(s.afk);
-  
-  try {
-    if (s.mc) {
-      s.mc.removeAllListeners();
-      s.mc.close();
-      s.mc = null;
-    }
-  } catch (e) {}
-  
-  sessions.delete(uid);
-  if (global.gc) global.gc();
+  cleanupSession(uid);
   return true;
 }
 
-function start(uid, i = null) {
+function startSession(uid, interaction = null) {
   const u = getUser(uid);
-  if (!u.server || !u.server.ip) {
-    if (i && !i.replied) i.editReply("⚠️ Configure Server Settings first.");
+  if (!u.server) {
+    if (interaction) interaction.editReply("⚠ Set settings first.");
     return;
   }
-  if (sessions.has(uid) && !sessions.get(uid).isRetry) {
-    if (i && !i.replied) i.editReply("⚠️ Bot already running.");
+  if (sessions.has(uid) && !sessions.get(uid).isRejoining) {
+    if (interaction) interaction.editReply("⚠ You already have a running bot.");
     return;
   }
 
   u.active = true;
   save();
 
-  const ip = u.server.ip;
-  const port = parseInt(u.server.port) || 19132;
+  const { ip, port } = u.server;
+  const authDir = getUserAuthDir(uid);
 
   const opts = {
     host: ip,
-    port,
-    connectTimeout: CONNECTION_TIMEOUT,
-    keepAlive: true,
-    version: u.bedrockVersion === "auto" ? undefined : u.bedrockVersion
+    port: parseInt(port),
+    connectTimeout: 25000,
+    keepAlive: true
   };
 
   if (u.connectionType === "offline") {
@@ -183,260 +351,185 @@ function start(uid, i = null) {
   } else {
     opts.username = uid;
     opts.offline = false;
-    opts.profilesFolder = getAuthPath(uid);
+    opts.profilesFolder = authDir;
   }
 
   const mc = bedrock.createClient(opts);
-  let state = sessions.get(uid) || { started: Date.now(), manualStop: false, connected: false, pkts: 0, isRetry: false };
-  state.mc = mc;
-  state.isRetry = false;
-  sessions.set(uid, state);
+  let session = sessions.get(uid) || { startedAt: Date.now(), manualStop: false, connected: false, pkts: 0 };
+  session.client = mc;
+  session.isRejoining = false;
+  sessions.set(uid, session);
 
-  // --- AGGRESSIVE RAM OPTIMIZATION ---
-  mc.on('packet', (p) => {
-    state.pkts++;
-    const n = p.data.name;
-    // Destroy world/chunk/entity data instantly
-    if (n.includes('chunk') || n.includes('level') || n.includes('metadata') || n.includes('entity') || n.includes('player_list')) {
-      if (p.data.payload) p.data.payload = null;
-      p.data = null; 
+  // --- PRODUCTION RAM OPTIMIZATION: PACKET STRIPPING ---
+  mc.on('packet', (packet) => {
+    session.pkts++;
+    const name = packet.data.name;
+    // Destroy world data immediately to save RAM
+    if (name.includes('chunk') || name.includes('level') || name.includes('metadata') || name.includes('entity') || name.includes('player_list')) {
+      if (packet.data.payload) packet.data.payload = null;
+      packet.data = null; 
     }
   });
 
+  // GEYSER FIX: Login success status
   mc.on('play_status', (p) => {
-    if ((p.status === 'player_spawn' || p.status === 'login_success') && !state.connected) {
-      onSpawned(uid, mc, state, i, ip, port);
+    if ((p.status === 'player_spawn' || p.status === 'login_success') && !session.connected) {
+      handleJoin(uid, mc, session, interaction, ip, port);
     }
   });
 
   mc.on("spawn", () => {
-    if (!state.connected) onSpawned(uid, mc, state, i, ip, port);
+    if (!session.connected) handleJoin(uid, mc, session, interaction, ip, port);
   });
 
-  state.timeout = setTimeout(() => {
-    if (sessions.has(uid) && !state.connected) {
-      if (i && i.deferred) i.editReply("❌ Connection Timeout (25s).");
+  session.timeout = setTimeout(() => {
+    if (sessions.has(uid) && !session.connected) {
+      if (interaction && interaction.deferred) interaction.editReply("❌ Connection error: Timeout (25s).");
       mc.close();
     }
-  }, CONNECTION_TIMEOUT);
+  }, 25000);
 
   mc.on("error", (e) => {
-    clearTimeout(state.timeout);
-    log(`❌ Error <@${uid}>: \`${e.message}\``, "#FF0000");
-    if (!state.manualStop) retry(uid, i);
+    clearTimeout(session.timeout);
+    logToDiscord(`❌ Bot Error <@${uid}>: \`${e.message}\``, "#FF0000");
+    if (!session.manualStop) handleRejoin(uid, interaction);
   });
 
   mc.on("close", () => {
-    clearTimeout(state.timeout);
-    log(`🔌 Closed <@${uid}>`, "#808080");
-    if (!state.manualStop) retry(uid, i);
+    clearTimeout(session.timeout);
+    logToDiscord(`🔌 Connection Closed <@${uid}>`, "#808080");
+    if (!session.manualStop) handleRejoin(uid, interaction);
   });
 }
 
-function onSpawned(uid, mc, state, i, ip, port) {
-  state.connected = true;
-  clearTimeout(state.timeout);
-  if (i && i.deferred) i.editReply(`🟢 Online at **${ip}:${port}**`);
-  log(`✅ Bot <@${uid}> Online on ${ip}`, "#00FF00");
+function handleJoin(uid, mc, session, interaction, ip, port) {
+  session.connected = true;
+  clearTimeout(session.timeout);
+  if (interaction && interaction.deferred) interaction.editReply(`🟢 Connected to **${ip}:${port}**`);
+  logToDiscord(`✅ Bot <@${uid}> is Online on ${ip}`, "#00FF00");
 
-  state.afk = setInterval(() => {
+  session.afkInterval = setInterval(() => {
     try {
       if (!mc.entityId) return;
       mc.write("move_player", {
-        runtime_id: mc.entityId, position: mc.entity?.position || {x:0,y:0,z:0}, pitch: 0, yaw: 0, head_yaw: 0,
+        runtime_id: mc.entityId,
+        position: mc.entity.position || {x:0,y:0,z:0},
+        pitch: 0, yaw: 0, head_yaw: 0,
         mode: 0, on_ground: true, ridden_runtime_id: 0, teleport: false
       });
-    } catch (e) {}
+    } catch {}
   }, 60000);
 }
 
-function retry(uid, i) {
+// ----------------- REJOIN LOGIC (30s) -----------------
+function handleRejoin(uid, interaction) {
   const s = sessions.get(uid);
-  if (!s || s.manualStop || s.reconnect) return;
-  s.isRetry = true;
+  if (!s || s.manualStop || s.reconnectTimer) return;
+
+  s.isRejoining = true;
   s.connected = false;
-  s.reconnect = setTimeout(() => {
+  s.reconnectTimer = setTimeout(() => {
     if (sessions.has(uid) && !s.manualStop) {
-      s.reconnect = null;
-      start(uid, i);
+      s.reconnectTimer = null;
+      startSession(uid, interaction);
     }
-  }, 120000);
+  }, 30000); // 30 second rejoin delay as requested
 }
 
-// ----------------------------------------------------------------
-// MICROSOFT AUTHENTICATION
-// ----------------------------------------------------------------
-
-async function link(uid, i) {
-  if (activeLinks.has(uid)) return i.editReply("⏳ Login already active.");
-
-  // Pre-reply to prevent Discord timeout
-  await i.editReply("⏳ Initializing Microsoft Authflow... Please wait.");
-
-  const authPath = getAuthPath(uid);
-  const u = getUser(uid);
-
+// ----------------- Interactions -----------------
+client.on(Events.InteractionCreate, async (i) => {
   try {
-    const flow = new Authflow(uid, authPath, {
-      flow: "live",
-      authTitle: Titles.MinecraftNintendoSwitch,
-      deviceType: "Nintendo"
-    }, async (data) => {
-      // Callback from prismarine-auth with code and link
-      const embed = new EmbedBuilder()
-        .setTitle("🔐 Microsoft Login")
-        .setDescription(`Code: **\`${data.user_code}\`**\n\n1. Click button below\n2. Enter the code\n\n*Bot will update when done.*`)
-        .setColor("#5865F2");
-      
-      const row = new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setLabel("Enter Code").setStyle(ButtonStyle.Link).setURL(data.verification_uri_complete)
-      );
+    if (denyIfWrongGuild(i)) return;
+    const uid = i.user.id;
 
-      await i.editReply({ content: null, embeds: [embed], components: [row] });
-    });
-
-    const p = (async () => {
-      try {
-        await flow.getMsaToken();
-        u.linked = true;
-        save();
-        await i.followUp({ ephemeral: true, content: "✅ Microsoft account linked!" });
-        log(`🔑 User <@${uid}> linked their account.`);
-      } catch (e) {
-        await i.followUp({ ephemeral: true, content: `❌ Auth Error: ${e.message}` });
-      } finally {
-        activeLinks.delete(uid);
+    if (i.isChatInputCommand()) {
+      if (i.commandName === "panel") {
+        return i.reply({ content: "🎛 **Bedrock AFK Panel**", components: panelRow() });
       }
-    })();
-
-    activeLinks.set(uid, p);
-
-  } catch (e) {
-    await i.editReply(`❌ Init Error: ${e.message}`);
-    activeLinks.delete(uid);
-  }
-}
-
-// ----------------------------------------------------------------
-// ADMIN INTERFACE
-// ----------------------------------------------------------------
-
-function getStats() {
-  const m = process.memoryUsage();
-  const rss = (m.rss / 1024 / 1024).toFixed(2);
-  const up = process.uptime();
-  return new EmbedBuilder()
-    .setTitle("🚀 Production Admin Dashboard")
-    .setColor("#2B2D31")
-    .addFields(
-      { name: "💻 System", value: `**RAM:** ${rss} MB\n**Uptime:** ${Math.floor(up/3600)}h ${Math.floor((up%3600)/60)}m`, inline: true },
-      { name: "📊 Bots", value: `**Active:** ${sessions.size}\n**Users:** ${Object.keys(users).length}`, inline: true }
-    )
-    .setTimestamp();
-}
-
-function getRows() {
-  const r = [new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId("adm_ref").setLabel("Refresh").setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId("adm_stop").setLabel("Stop All").setStyle(ButtonStyle.Danger)
-  )];
-  if (sessions.size > 0) {
-    const opts = Array.from(sessions.keys()).slice(0, 25).map(id => ({ label: id, value: id }));
-    r.push(new ActionRowBuilder().addComponents(new StringSelectMenuBuilder().setCustomId("adm_force").setPlaceholder("Force Stop User").addOptions(opts)));
-  }
-  return r;
-}
-
-// ----------------------------------------------------------------
-// HANDLERS
-// ----------------------------------------------------------------
-
-client.once("ready", async () => {
-  console.log(`🟢 Production Instance: ${client.user.tag}`);
-  const cmds = [
-    new SlashCommandBuilder().setName("panel").setDescription("User Control Panel"),
-    new SlashCommandBuilder().setName("admin").setDescription("Admin Analytics")
-  ];
-  await client.application.commands.set(cmds);
-
-  // Post-Deployment Auto-Restore
-  const restoreUids = Object.keys(users).filter(id => users[id].active === true);
-  restoreUids.forEach((id, idx) => setTimeout(() => start(id), idx * 3000));
-
-  setInterval(async () => {
-    if (adminPanel) {
-      try { await adminPanel.edit({ embeds: [getStats()], components: getRows() }); } catch (e) { adminPanel = null; }
-    }
-  }, 30000);
-});
-
-client.on(Events.InteractionCreate, async (interaction) => {
-  try {
-    if (!checkGuild(interaction)) return;
-    const uid = interaction.user.id;
-
-    if (interaction.isChatInputCommand()) {
-      if (interaction.commandName === "panel") {
-        const row = new ActionRowBuilder().addComponents(
-          new ButtonBuilder().setCustomId("btn_l").setLabel("Link Microsoft").setStyle(ButtonStyle.Primary),
-          new ButtonBuilder().setCustomId("btn_u").setLabel("Unlink").setStyle(ButtonStyle.Secondary),
-          new ButtonBuilder().setCustomId("btn_on").setLabel("Start").setStyle(ButtonStyle.Success),
-          new ButtonBuilder().setCustomId("btn_off").setLabel("Stop").setStyle(ButtonStyle.Danger),
-          new ButtonBuilder().setCustomId("btn_s").setLabel("Settings").setStyle(ButtonStyle.Secondary)
-        );
-        return interaction.reply({ content: "🎛 **AFK Bot Panel**", components: [row] });
-      }
-      if (interaction.commandName === "admin") {
-        if (uid !== ADMIN_ID) return interaction.reply({ content: "⛔ Access Denied.", ephemeral: true });
-        adminPanel = await interaction.reply({ embeds: [getStats()], components: getRows(), fetchReply: true });
+      if (i.commandName === "admin") {
+        if (uid !== ADMIN_ID) return i.reply({ content: "⛔ Unauthorized", ephemeral: true });
+        adminPanelMessage = await i.reply({ embeds: [getAdminStats()], components: adminPanelComponents(), fetchReply: true });
         return;
       }
     }
 
-    if (interaction.isButton()) {
-      if (interaction.customId === "adm_ref") return interaction.update({ embeds: [getStats()], components: getRows() });
-      if (interaction.customId === "adm_stop") {
+    if (i.isButton()) {
+      if (i.customId === "admin_refresh") return i.update({ embeds: [getAdminStats()], components: adminPanelComponents() });
+      if (i.customId === "admin_stop_all") {
         if (uid !== ADMIN_ID) return;
-        for (const [id, s] of sessions) { stop(id, true); dm(id, "⚠️ Your bot was stopped by admin."); }
-        return interaction.reply({ content: "All bots terminated.", ephemeral: true });
+        let count = 0;
+        for (const [id, s] of sessions) { stopSession(id, true); sendPrivateDM(id, "⚠️ Stopped by admin."); count++; }
+        return i.reply({ content: `Stopped ${count} bots.`, ephemeral: true });
       }
-      if (interaction.customId === "btn_l") { await interaction.deferReply({ ephemeral: true }); return link(uid, interaction); }
-      if (interaction.customId === "btn_u") {
-        const p = getAuthPath(uid); if (fs.existsSync(p)) fs.rmSync(p, { recursive: true, force: true });
-        const profile = getUser(uid); profile.linked = false; profile.active = false; save();
-        return interaction.reply({ content: "🗑 Account Unlinked.", ephemeral: true });
+
+      if (i.customId === "link") {
+        await i.deferReply({ ephemeral: true });
+        return linkMicrosoft(uid, i);
       }
-      if (interaction.customId === "btn_on") { await interaction.deferReply({ ephemeral: true }); return start(uid, interaction); }
-      if (interaction.customId === "btn_off") {
-        if (stop(uid, true)) return interaction.reply({ content: "⏹ Bot Stopped.", ephemeral: true });
-        return interaction.reply({ content: "Bot not active.", ephemeral: true });
+
+      if (i.customId === "unlink") {
+        unlinkMicrosoft(uid);
+        return i.reply({ ephemeral: true, content: "🗑 Microsoft account unlinked." });
       }
-      if (interaction.customId === "btn_s") {
-        const p = getUser(uid);
-        const modal = new ModalBuilder().setCustomId("m_s").setTitle("Settings");
+
+      if (i.customId === "settings") {
+        const u = getUser(uid);
+        const modal = new ModalBuilder().setCustomId("settings_modal").setTitle("⚙ Bedrock Settings");
         modal.addComponents(
-          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("i_ip").setLabel("Server IP").setStyle(TextInputStyle.Short).setValue(p.server?.ip || "")),
-          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("i_p").setLabel("Port").setStyle(TextInputStyle.Short).setValue(String(p.server?.port || 19132))),
-          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("i_o").setLabel("Offline Name").setStyle(TextInputStyle.Short).setValue(p.offlineUsername || ""))
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("ip").setLabel("Server IP").setStyle(TextInputStyle.Short).setRequired(true).setValue(u.server?.ip || "")),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("port").setLabel("Port").setStyle(TextInputStyle.Short).setRequired(true).setValue(String(u.server?.port || 19132))),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("offline").setLabel("Offline username").setStyle(TextInputStyle.Short).setRequired(false).setValue(u.offlineUsername || ""))
         );
-        return interaction.showModal(modal);
+        return i.showModal(modal);
+      }
+
+      if (i.customId === "start") {
+        await i.deferReply({ ephemeral: true });
+        return startSession(uid, i);
+      }
+
+      if (i.customId === "stop") {
+        if (stopSession(uid, true)) return i.reply({ ephemeral: true, content: "⏹ Stopped." });
+        return i.reply({ ephemeral: true, content: "No bot active." });
+      }
+
+      if (i.customId === "more") {
+        const u = getUser(uid);
+        return i.reply({
+          ephemeral: true,
+          content: "➕ **More options**",
+          components: [
+            new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId("invisible").setLabel("👻 Invisible Mode").setStyle(ButtonStyle.Secondary)),
+            versionRow(u.bedrockVersion),
+            connRow(u.connectionType)
+          ]
+        });
       }
     }
 
-    if (interaction.isModalSubmit() && interaction.customId === "m_s") {
-      const p = getUser(uid);
-      p.server = { ip: interaction.fields.getTextInputValue("i_ip"), port: interaction.fields.getTextInputValue("i_p") };
-      p.offlineUsername = interaction.fields.getTextInputValue("i_o");
+    if (i.isStringSelectMenu()) {
+      const u = getUser(uid);
+      if (i.customId === "set_version") { u.bedrockVersion = i.values[0]; save(); return i.reply({ ephemeral: true, content: `Version: ${u.bedrockVersion}` }); }
+      if (i.customId === "set_conn") { u.connectionType = i.values[0]; save(); return i.reply({ ephemeral: true, content: `Auth: ${u.connectionType}` }); }
+      if (i.customId === "admin_force_stop") {
+        if (uid !== ADMIN_ID) return;
+        if (stopSession(i.values[0], true)) {
+          sendPrivateDM(i.values[0], "⚠️ Stopped by admin.");
+          return i.reply({ ephemeral: true, content: "Bot terminated." });
+        }
+      }
+    }
+
+    if (i.isModalSubmit() && i.customId === "settings_modal") {
+      const u = getUser(uid);
+      u.server = { ip: i.fields.getTextInputValue("ip"), port: i.fields.getTextInputValue("port") };
+      u.offlineUsername = i.fields.getTextInputValue("offline");
       save();
-      return interaction.reply({ content: "✅ Saved.", ephemeral: true });
+      return i.reply({ ephemeral: true, content: "✅ Saved." });
     }
-    
-    if (interaction.isStringSelectMenu() && interaction.customId === "adm_force") {
-      const target = interaction.values[0];
-      if (stop(target, true)) { dm(target, "⚠️ Bot stopped by admin."); return interaction.reply({ content: `✅ Stopped <@${target}>`, ephemeral: true }); }
-    }
-  } catch (err) { console.error(err); }
+  } catch (e) { console.error(e); }
 });
 
 process.on("unhandledRejection", (e) => console.error(e));
 client.login(DISCORD_TOKEN);
+
