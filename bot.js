@@ -1,12 +1,3 @@
-/**
- * Bedrock AFK Bot - "Divine Physics" Edition
- * Ominaisuudet:
- * - Edistynyt fysiikkamoottori (Lerp, Brownian motion, Painovoima)
- * - Automaattinen uudelleenyhdistys (2 min välein)
- * - Admin-järjestelmä kanavakohtaisilla rajoituksilla
- * - Englanninkielinen käyttöliittymä
- */
-
 const {
   Client,
   GatewayIntentBits,
@@ -26,17 +17,17 @@ const { Authflow, Titles } = require("prismarine-auth");
 const fs = require("fs");
 const path = require("path");
 
-// --- Asetukset ja vakiot ---
+// ----------------- Configuration -----------------
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 if (!DISCORD_TOKEN) {
-  console.error("❌ DISCORD_TOKEN puuttuu ympäristömuuttujista");
+  console.error("❌ DISCORD_TOKEN missing from environment variables");
   process.exit(1);
 }
 
 const ALLOWED_GUILD_ID = "1462335230345089254";
 const ADMIN_CHANNEL_ID = "1464615993320935447";
 
-// --- Tiedostopohjainen tallennus ---
+// ----------------- Storage -----------------
 const DATA = path.join(__dirname, "data");
 const AUTH_ROOT = path.join(DATA, "auth");
 const STORE = path.join(DATA, "users.json");
@@ -61,17 +52,17 @@ function getUserAuthDir(uid) {
   return dir;
 }
 
-// --- Runtime-muuttujat ---
+// ----------------- Runtime -----------------
 const sessions = new Map();
 const pendingLink = new Map();
+const lastMsa = new Map();
 
-// --- Discord Client alustus ---
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
-// --- Matematiikka-apufunktiot fysiikkaan ---
+// ----------------- Physics Helpers -----------------
 const lerp = (start, end, amt) => (1 - amt) * start + amt * end;
 
-// --- Käyttöliittymä-apulaiset ---
+// ----------------- UI Helpers -----------------
 function panelRow() {
   return [
     new ActionRowBuilder().addComponents(
@@ -84,7 +75,62 @@ function panelRow() {
   ];
 }
 
-// --- Botin session hallinta ---
+// ----------------- Microsoft Link Logic -----------------
+async function linkMicrosoft(uid, interaction) {
+  if (pendingLink.has(uid)) {
+    await interaction.editReply("⏳ Login already in progress. Check the previous code.").catch(() => {});
+    return;
+  }
+
+  const authDir = getUserAuthDir(uid);
+  const u = getUser(uid);
+  let codeShown = false;
+
+  const flow = new Authflow(
+    uid,
+    authDir,
+    {
+      flow: "live",
+      authTitle: Titles?.MinecraftNintendoSwitch || "Bedrock AFK Bot",
+      deviceType: "Nintendo"
+    },
+    async (data) => {
+      const uri = data.verification_uri_complete || data.verification_uri || "https://www.microsoft.com/link";
+      const code = data.user_code || "(no code)";
+      lastMsa.set(uid, { uri, code, at: Date.now() });
+      codeShown = true;
+
+      const msg = 
+        `🔐 **Microsoft Login Required**\n\n` +
+        `1. Go to: **${uri}**\n` +
+        `2. Enter Code: \`${code}\`\n\n` +
+        `⚠ Use a dedicated AFK account. This message will update when done.`;
+
+      await interaction.editReply({ 
+        content: msg, 
+        components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setLabel("🌐 Open Link").setStyle(ButtonStyle.Link).setURL(uri))]
+      }).catch(() => {});
+    }
+  );
+
+  const p = (async () => {
+    try {
+      if (!codeShown) await interaction.editReply("⏳ Requesting Microsoft login code…").catch(() => {});
+      await flow.getMsaToken();
+      u.linked = true;
+      save();
+      await interaction.followUp({ ephemeral: true, content: "✅ Microsoft account linked successfully!" }).catch(() => {});
+    } catch (e) {
+      await interaction.editReply(`❌ Login failed: ${String(e.message)}`).catch(() => {});
+    } finally {
+      pendingLink.delete(uid);
+    }
+  })();
+
+  pendingLink.set(uid, p);
+}
+
+// ----------------- Bot Session Logic -----------------
 function cleanupSession(uid) {
   const s = sessions.get(uid);
   if (!s) return;
@@ -97,33 +143,26 @@ function cleanupSession(uid) {
 function stopSession(uid) {
   if (!sessions.has(uid)) return false;
   const s = sessions.get(uid);
-  s.manualStop = true; // Estetään automaattinen uudelleenyhdistys
+  s.manualStop = true;
   cleanupSession(uid);
   return true;
 }
 
-/**
- * Käynnistää Bedrock-istunnon ja fysiikkamoottorin
- */
 function startSession(uid, interaction) {
   const u = getUser(uid);
   if (!u.server) {
-    if (interaction && !interaction.replied) interaction.editReply("⚠ Please configure server settings first.").catch(() => {});
+    if (interaction && !interaction.replied) interaction.editReply("⚠ Configure settings first.").catch(() => {});
     return;
   }
-  
   if (sessions.has(uid) && !sessions.get(uid).isDisconnected) return;
 
   const { ip, port } = u.server;
-  const authDir = getUserAuthDir(uid);
-
   const mc = bedrock.createClient({
     host: ip,
     port: port || 19132,
-    profilesFolder: authDir,
+    profilesFolder: getUserAuthDir(uid),
     username: uid,
     offline: u.connectionType === "offline",
-    skipPing: false,
     connectTimeout: 45000
   });
 
@@ -133,7 +172,7 @@ function startSession(uid, interaction) {
     isDisconnected: false,
     packetCount: 0,
     serverInfo: { ip, port },
-    // --- Divine Physics State ---
+    // Advanced Physics State
     pos: { x: 0, y: 0, z: 0 },
     vel: { x: 0, y: 0, z: 0 },
     yaw: 0,
@@ -143,111 +182,93 @@ function startSession(uid, interaction) {
     isMoving: false,
     onGround: true,
     tickCount: 0,
-    nextDecisionTick: 0,
-    moveDir: 1
+    nextDecisionTick: 0
   };
   sessions.set(uid, session);
 
-  // Pakettien seuranta admin-infoa varten
   mc.on('packet', () => session.packetCount++);
 
   mc.on("spawn", () => {
-    if (interaction) interaction.editReply(`🟢 **Divine Physics Active** on **${ip}:${port}**`).catch(() => {});
-    
-    // Alustetaan sijainti spawniin
-    if (mc.entity?.position) {
-      session.pos = { ...mc.entity.position };
-      session.yaw = mc.entity.yaw || 0;
-      session.pitch = mc.entity.pitch || 0;
-    }
+    if (interaction) interaction.editReply(`🟢 **Divine Physics Engine** active on **${ip}:${port}**`).catch(() => {});
+    if (mc.entity?.position) session.pos = { ...mc.entity.position };
 
-    // --- DIVINE PHYSICS ENGINE (20 Ticks Per Second) ---
+    // --- DIVINE PHYSICS LOOP (20 TPS) ---
     session.physicsLoop = setInterval(() => {
       if (!mc.entityId) return;
       session.tickCount++;
 
-      // 1. Päätöksenteko (Inhimillinen logiikka)
+      // 1. Human Decision Logic
       if (session.tickCount >= session.nextDecisionTick) {
         const roll = Math.random();
-        if (roll < 0.25) { 
-          // Aloita kävely tai vaihda suuntaa
+        if (roll < 0.3) { 
           session.isMoving = true;
-          session.targetYaw = (session.targetYaw + (Math.random() * 120 - 60)) % 360;
+          session.targetYaw = (session.targetYaw + (Math.random() * 160 - 80)) % 360;
           session.nextDecisionTick = session.tickCount + 80 + Math.random() * 120;
-          session.moveDir = Math.random() > 0.2 ? 1 : -1; // Suurin osa ajasta eteenpäin
-        } else if (roll < 0.45) { 
-          // Pysähdy ja katsele ympärillesi
+        } else if (roll < 0.5) { 
           session.isMoving = false;
-          session.targetPitch = Math.random() * 30 - 15;
-          session.nextDecisionTick = session.tickCount + 150 + Math.random() * 250;
+          session.targetPitch = Math.random() * 40 - 20;
+          session.nextDecisionTick = session.tickCount + 100 + Math.random() * 200;
         } else { 
-          // Pieniä korjausliikkeitä katseeseen (Micro-twitches)
-          session.targetYaw += Math.random() * 20 - 10;
-          session.nextDecisionTick = session.tickCount + 40 + Math.random() * 60;
+          session.targetYaw += Math.random() * 15 - 7.5;
+          session.nextDecisionTick = session.tickCount + 30 + Math.random() * 60;
         }
         
-        // Satunnainen hyppy (Realistinen pelaajien tylsistymiskäytös)
-        if (session.isMoving && Math.random() < 0.08 && session.onGround) {
+        if (session.isMoving && Math.random() < 0.05 && session.onGround) {
           session.vel.y = 0.42; 
           session.onGround = false;
         }
       }
 
-      // 2. Kameran sulavuus (Interpolointi/Lerp)
-      session.yaw = lerp(session.yaw, session.targetYaw, 0.12);
-      session.pitch = lerp(session.pitch, session.targetPitch, 0.08);
+      // 2. Camera Smoothing
+      session.yaw = lerp(session.yaw, session.targetYaw, 0.15);
+      session.pitch = lerp(session.pitch, session.targetPitch, 0.1);
 
-      // 3. Inhimillinen kohina (Hengitysefekti ja Brownian motion)
-      const breathing = Math.sin(session.tickCount * 0.04) * 0.4;
-      const jitter = (Math.random() - 0.5) * 0.15;
+      // 3. Human Noise (Breathing & Jitter)
+      const breathing = Math.sin(session.tickCount * 0.05) * 0.4;
+      const jitter = (Math.random() - 0.5) * 0.1;
       const finalPitch = session.pitch + breathing + jitter;
-      const finalYaw = session.yaw + (Math.random() - 0.5) * 0.1;
 
-      // 4. Liikkuminen ja Fysiikka (Painovoima & Kitka)
+      // 4. Locomotion & Forces
       const friction = session.onGround ? 0.91 : 0.98;
-      const accel = session.onGround ? 0.09 : 0.02;
+      const accel = session.onGround ? 0.1 : 0.02;
 
       if (session.isMoving) {
         const rad = (session.yaw + 90) * (Math.PI / 180);
-        session.vel.x += Math.cos(rad) * accel * session.moveDir;
-        session.vel.z += Math.sin(rad) * accel * session.moveDir;
+        session.vel.x += Math.cos(rad) * accel;
+        session.vel.z += Math.sin(rad) * accel;
       }
 
-      // Vaikutukset nopeuteen
-      session.vel.y -= 0.08; // Painovoima
-      session.vel.y *= 0.98; // Ilmanvastus
+      session.vel.y -= 0.08; // Gravity
       session.vel.x *= friction;
       session.vel.z *= friction;
+      session.vel.y *= 0.98;
 
-      // Sijainnin päivitys
       session.pos.x += session.vel.x;
       session.pos.y += session.vel.y;
       session.pos.z += session.vel.z;
 
-      // Yksinkertainen maakosketus (estää putoamisen maailman läpi)
-      const groundY = mc.entity?.position?.y || session.pos.y;
-      if (session.pos.y < groundY - 0.1) {
-        session.pos.y = groundY;
+      // Simple Floor Collision
+      const floor = mc.entity?.position?.y || session.pos.y;
+      if (session.pos.y < floor - 0.1) {
+        session.pos.y = floor;
         session.vel.y = 0;
         session.onGround = true;
       }
 
-      // 5. Verkkosynkronointi (Paketin lähetys)
+      // 5. Sync
       try {
         mc.write("move_player", {
           runtime_id: mc.entityId,
           position: session.pos,
           pitch: finalPitch,
-          yaw: finalYaw,
-          head_yaw: finalYaw,
+          yaw: session.yaw,
+          head_yaw: session.yaw,
           mode: 0,
           on_ground: session.onGround,
           ridden_runtime_id: 0,
           teleport: false
         });
-      } catch (err) {
-        // Hiljainen virhe jos yhteys katkeaa loopin aikana
-      }
+      } catch {}
     }, 50);
   });
 
@@ -255,9 +276,9 @@ function startSession(uid, interaction) {
     session.isDisconnected = true;
     if (session.physicsLoop) clearInterval(session.physicsLoop);
     
-    // --- Automaattinen uudelleenyhdistys (2 min) ---
+    // Auto-rejoin logic (2 minutes)
     if (!session.manualStop) {
-      console.log(`Bot for ${uid} disconnected. Auto-rejoin in 120s...`);
+      console.log(`[DISCONNECT] ${uid} - Rejoining in 120s...`);
       session.rejoinTimeout = setTimeout(() => {
         if (!session.manualStop) startSession(uid, interaction);
       }, 120000);
@@ -266,144 +287,109 @@ function startSession(uid, interaction) {
     }
   });
 
-  mc.on("error", (err) => {
-    console.error(`[MC ERROR] ${uid}:`, err.message);
+  mc.on("error", (e) => {
+    console.error(`[MC ERROR] ${uid}:`, e);
     session.isDisconnected = true;
   });
 }
 
-// --- Discord-vuorovaikutus ---
+// ----------------- Interactions -----------------
 client.on(Events.InteractionCreate, async (i) => {
   const uid = i.user.id;
 
-  // Estetään käyttö muilla palvelimilla
   if (i.guildId !== ALLOWED_GUILD_ID) {
-    return i.reply({ ephemeral: true, content: "⛔ This bot is restricted to a specific server." }).catch(() => {});
+    return i.reply({ ephemeral: true, content: "⛔ Restricted access." }).catch(() => {});
   }
 
   if (i.isChatInputCommand()) {
     if (i.commandName === "panel") {
-      return i.reply({ content: "🛠 **Bedrock AFK Pro Manager**\nStatus: Online | Engine: Divine Physics", components: panelRow() });
+      return i.reply({ content: "🎛 **Divine Bedrock Manager**\nStatus: Online | Multitenant-Ready", components: panelRow() });
     }
 
-    // ADMIN-KOMENNOT
-    if (i.commandName === "admin") {
-      if (i.channelId !== ADMIN_CHANNEL_ID) {
-        return i.reply({ ephemeral: true, content: "❌ This command can only be used in the Admin Channel." });
-      }
-
+    if (i.commandName === "admin" && i.channelId === ADMIN_CHANNEL_ID) {
       const sub = i.options.getSubcommand();
       
       if (sub === "info") {
         const mem = process.memoryUsage().rss / 1024 / 1024;
         let stats = "";
         sessions.forEach((s, id) => {
-          stats += `👤 <@${id}> | IP: \`${s.serverInfo.ip}\` | Pkts: \`${s.packetCount}\` | Status: \`${s.isDisconnected ? "REJOINING" : "LIVE"}\`\n`;
+          stats += `👤 <@${id}> | IP: \`${s.serverInfo.ip}\` | Pkts: \`${s.packetCount}\` | ${s.isDisconnected ? "REJOINING" : "LIVE"}\n`;
         });
 
         const embed = new EmbedBuilder()
-          .setTitle("🚀 Global System Diagnostics")
-          .setColor(0x5865F2)
+          .setTitle("🛠 Global System Stats")
+          .setColor(0x00FF00)
           .addFields(
-            { name: "Memory (RAM)", value: `\`${mem.toFixed(1)} MB\``, inline: true },
-            { name: "Active Bots", value: `\`${sessions.size}\``, inline: true },
-            { name: "Uptime", value: `<t:${Math.floor(client.readyTimestamp / 1000)}:R>`, inline: true }
+            { name: "RAM", value: `\`${mem.toFixed(1)}MB\``, inline: true },
+            { name: "Active", value: `\`${sessions.size}\``, inline: true }
           )
-          .setDescription(stats || "No active AFK sessions at the moment.")
-          .setFooter({ text: "Divine Physics Engine v2.0" })
-          .setTimestamp();
-
+          .setDescription(stats || "No sessions active.");
         return i.reply({ embeds: [embed] });
-      }
-
-      if (sub === "stop-user") {
-        const target = i.options.getUser("target");
-        const ok = stopSession(target.id);
-        return i.reply({ content: ok ? `✅ Force stopped bot for <@${target.id}>.` : `❌ User has no active bot.` });
       }
 
       if (sub === "stop-all") {
         const count = sessions.size;
         sessions.forEach((_, id) => stopSession(id));
-        return i.reply(`🛑 Successfully terminated all **${count}** running bots.`);
+        return i.reply(`🛑 Terminated **${count}** sessions.`);
       }
+    } else if (i.commandName === "admin") {
+      return i.reply({ ephemeral: true, content: "❌ Admins only. Use the correct channel." });
     }
   }
 
   if (i.isButton()) {
     if (i.customId === "link") {
       await i.deferReply({ ephemeral: true });
-      // Tähän kohtaan tulisi Microsoft-linkityksen logiikka (Authflow)
-      // (Pidetty samana kuin aiemmissa versioissa)
-      i.editReply("⏳ Microsoft linking process started. Follow the instructions in DM/Console.");
+      return linkMicrosoft(uid, i);
     }
     
     if (i.customId === "start") {
       await i.deferReply({ ephemeral: true });
-      await i.editReply("⏳ Initializing Divine Physics Engine and connecting…");
       startSession(uid, i);
     }
     
     if (i.customId === "stop") {
       const ok = stopSession(uid);
-      i.reply({ ephemeral: true, content: ok ? "🛑 Bot stopped and auto-rejoin disabled." : "❌ No bot running." });
-    }
-    
-    if (i.customId === "settings") {
-      const u = getUser(uid);
-      const modal = new ModalBuilder().setCustomId("sets").setTitle("Bedrock Server Settings");
-      const ipInput = new TextInputBuilder().setCustomId("ip").setLabel("Server IP").setStyle(TextInputStyle.Short).setValue(u.server?.ip || "");
-      const portInput = new TextInputBuilder().setCustomId("port").setLabel("Port").setStyle(TextInputStyle.Short).setValue(String(u.server?.port || 19132));
-      
-      modal.addComponents(
-        new ActionRowBuilder().addComponents(ipInput),
-        new ActionRowBuilder().addComponents(portInput)
-      );
-      i.showModal(modal);
+      i.reply({ ephemeral: true, content: ok ? "⏹ Session stopped." : "❌ No active session." });
     }
 
     if (i.customId === "unlink") {
       const u = getUser(uid);
       u.linked = false;
       save();
-      i.reply({ ephemeral: true, content: "🗑 Microsoft account unlinked." });
+      i.reply({ ephemeral: true, content: "🗑 Microsoft link removed." });
+    }
+
+    if (i.customId === "settings") {
+      const u = getUser(uid);
+      const modal = new ModalBuilder().setCustomId("sets").setTitle("Server Config");
+      const ip = new TextInputBuilder().setCustomId("ip").setLabel("IP").setStyle(TextInputStyle.Short).setValue(u.server?.ip || "");
+      const port = new TextInputBuilder().setCustomId("port").setLabel("Port").setStyle(TextInputStyle.Short).setValue(String(u.server?.port || 19132));
+      modal.addComponents(new ActionRowBuilder().addComponents(ip), new ActionRowBuilder().addComponents(port));
+      i.showModal(modal);
     }
   }
 
   if (i.isModalSubmit() && i.customId === "sets") {
     const u = getUser(uid);
-    const ip = i.fields.getTextInputValue("ip").trim();
-    const port = parseInt(i.fields.getTextInputValue("port").trim());
-    
-    if (!ip || isNaN(port)) return i.reply({ ephemeral: true, content: "❌ Invalid IP or Port." });
-    
-    u.server = { ip, port };
+    u.server = { ip: i.fields.getTextInputValue("ip"), port: parseInt(i.fields.getTextInputValue("port")) };
     save();
-    i.reply({ ephemeral: true, content: `✅ Server set to **${ip}:${port}**` });
+    i.reply({ ephemeral: true, content: "✅ Settings saved." });
   }
 });
 
-// --- Käynnistys ---
+// ----------------- Initialization -----------------
 client.once("ready", () => {
-  console.log(`✅ Kirjauduttu sisään: ${client.user.tag}`);
-  
-  // Slash-komentojen rekisteröinti
+  console.log(`✅ System Online: ${client.user.tag}`);
   client.application.commands.set([
-    new SlashCommandBuilder().setName("panel").setDescription("Open the AFK management panel"),
-    new SlashCommandBuilder()
-      .setName("admin")
-      .setDescription("Admin control commands")
-      .addSubcommand(s => s.setName("info").setDescription("View bot stats and RAM"))
-      .addSubcommand(s => s.setName("stop-all").setDescription("Force kill all bots"))
-      .addSubcommand(s => 
-        s.setName("stop-user")
-         .setDescription("Stop a specific user's bot")
-         .addUserOption(o => o.setName("target").setDescription("User to stop").setRequired(true))
-      )
+    new SlashCommandBuilder().setName("panel").setDescription("User AFK Panel"),
+    new SlashCommandBuilder().setName("admin").setDescription("Global Admin Control")
+      .addSubcommand(s => s.setName("info").setDescription("System stats"))
+      .addSubcommand(s => s.setName("stop-all").setDescription("Kill all bots"))
   ]);
 });
 
-process.on("unhandledRejection", (e) => console.error("Unhandled Rejection:", e));
+process.on("unhandledRejection", e => console.error("Unhandled:", e));
 
 client.login(DISCORD_TOKEN);
 
