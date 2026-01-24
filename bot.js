@@ -189,7 +189,7 @@ function startSession(uid, interaction) {
   mc.on('packet', () => session.packetCount++);
 
   mc.on("spawn", () => {
-    if (interaction) interaction.editReply(`🟢 **Divine Physics Engine** active on **${ip}:${port}**`).catch(() => {});
+    if (interaction) interaction.editReply(`🟢 **Bot** active on **${ip}:${port}**`).catch(() => {});
     if (mc.entity?.position) session.pos = { ...mc.entity.position };
 
     // --- DIVINE PHYSICS LOOP (20 TPS) ---
@@ -303,7 +303,7 @@ client.on(Events.InteractionCreate, async (i) => {
 
   if (i.isChatInputCommand()) {
     if (i.commandName === "panel") {
-      return i.reply({ content: "🎛 **Divine Bedrock Manager**\nStatus: Online | Multitenant-Ready", components: panelRow() });
+      return i.reply({ content: "🎛 **Bedrock Manager**\nStatus: Online", components: panelRow() });
     }
 
     if (i.commandName === "admin" && i.channelId === ADMIN_CHANNEL_ID) {
