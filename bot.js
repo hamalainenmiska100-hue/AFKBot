@@ -1,7 +1,6 @@
 /**
  * Bedrock AFK Bot - "Divine Physics" v4
- * Korjattu LootLabs.gg API-integraatio (Array-parsing fix)
- * Sisältää teknisen virheraportoinnin ja kaikki aiemmat logiikat.
+ * Fixed LootLabs conversion tracking with user_id parameter.
  */
 
 const {
@@ -25,16 +24,16 @@ const path = require("path");
 const crypto = require("crypto");
 const axios = require("axios");
 
-// --- Asetukset ---
+// ----------------- Configuration -----------------
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const ALLOWED_GUILD_ID = "1462335230345089254";
 const ADMIN_CHANNEL_ID = "1464615993320935447";
 
-// --- LootLabs API tiedot ---
+// ----------------- LootLabs Integration -----------------
 const LOOTLABS_API_KEY = "33e661bfba65b1587c3c41d39dbdee9f2fe0a3f8ad624240c9289bed0c22c2bd";
-const AD_COOLDOWN_MS = 2 * 24 * 60 * 60 * 1000; // 48 tuntia
+const AD_COOLDOWN_MS = 2 * 24 * 60 * 60 * 1000; // 48 Hours
 
-// --- Tallennus ---
+// ----------------- Storage -----------------
 const DATA = path.join(__dirname, "data");
 const AUTH_ROOT = path.join(DATA, "auth");
 const STORE = path.join(DATA, "users.json");
@@ -60,14 +59,14 @@ function getUserAuthDir(uid) {
   return dir;
 }
 
-// --- Istunnon hallinta ---
+// ----------------- Runtime State -----------------
 const sessions = new Map();
 const pendingLink = new Map();
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
 const lerp = (start, end, amt) => (1 - amt) * start + amt * end;
 
-// --- Käyttöliittymä ---
+// ----------------- UI Builders -----------------
 function panelRow() {
   return [
     new ActionRowBuilder().addComponents(
@@ -80,9 +79,9 @@ function panelRow() {
   ];
 }
 
-// --- Microsoft Kirjautuminen ---
+// ----------------- Microsoft Auth -----------------
 async function linkMicrosoft(uid, interaction) {
-  if (pendingLink.has(uid)) return interaction.editReply("⏳ Login in progress. Please check the last code sent.");
+  if (pendingLink.has(uid)) return interaction.editReply("⏳ Login already in progress. Check the last code.").catch(() => {});
   const authDir = getUserAuthDir(uid);
   const u = getUser(uid);
   
@@ -104,7 +103,7 @@ async function linkMicrosoft(uid, interaction) {
       await flow.getMsaToken();
       u.linked = true;
       save();
-      await interaction.followUp({ ephemeral: true, content: "✅ Successfully linked Microsoft account! 🥳" });
+      await interaction.followUp({ ephemeral: true, content: "✅ Linked successfully! 🥳" });
     } catch (e) {
       await interaction.editReply(`❌ Login failed: ${e.message}`);
     } finally {
@@ -114,11 +113,10 @@ async function linkMicrosoft(uid, interaction) {
   pendingLink.set(uid, promise);
 }
 
-// --- LootLabs API Hallinta ---
+// ----------------- LootLabs API -----------------
 
 /**
- * Luodaan dynaaminen LootLabs-linkki ja palautetaan virhetiedot jos epäonnistuu
- * KORJAUS: Käsittelee nyt 'message' kentän taulukkona!
+ * Creates a dynamic link and appends the user_id for tracking
  */
 async function createLootLabsLink(userId) {
   try {
@@ -135,26 +133,27 @@ async function createLootLabsLink(userId) {
       }
     });
 
-    // Tarkistetaan onko vastaus taulukko (kuten kuvassa näkyi)
-    if (response.data?.message && Array.isArray(response.data.message) && response.data.message[0]?.loot_url) {
-      return { url: response.data.message[0].loot_url };
-    } 
-    // Tai onko se suora objekti (dokumentaation mukaan)
-    else if (response.data?.message?.loot_url) {
-      return { url: response.data.message.loot_url };
+    let rawUrl = "";
+    if (response.data?.message && Array.isArray(response.data.message)) {
+      rawUrl = response.data.message[0].loot_url;
+    } else if (response.data?.message?.loot_url) {
+      rawUrl = response.data.message.loot_url;
     }
-    
-    return { error: "Unknown response format", data: response.data };
+
+    if (rawUrl) {
+      // TÄRKEÄ KORJAUS: Lisätään user_id parametri linkkiin
+      const separator = rawUrl.includes('?') ? '&' : '?';
+      return { url: `${rawUrl}${separator}user_id=${userId}` };
+    }
+
+    return { error: "Unknown format", data: response.data };
   } catch (err) {
-    return { 
-      error: err.message, 
-      data: err.response?.data || "No response data from server" 
-    };
+    return { error: err.message, data: err.response?.data || "No data" };
   }
 }
 
 /**
- * Tarkistetaan onko konversio suoritettu
+ * Verifies if LootLabs has recorded a conversion for this user
  */
 async function verifyAdCompletion(userId) {
   try {
@@ -164,15 +163,17 @@ async function verifyAdCompletion(userId) {
         user_id: userId 
       }
     });
-    return response.data && response.data.length > 0;
+    
+    if (response.data && response.data.length > 0) {
+      return { success: true };
+    }
+    return { success: false, data: response.data };
   } catch (err) {
-    console.error("Technical Verification Fail:", err.message);
-    return false;
+    return { success: false, error: err.message };
   }
 }
 
-// --- Minecraft Botin Hallinta ---
-
+// ----------------- Minecraft Logic -----------------
 function stopSession(uid) {
   const s = sessions.get(uid);
   if (!s) return false;
@@ -194,7 +195,7 @@ function actualConnect(uid, interaction) {
     profilesFolder: getUserAuthDir(uid),
     username: uid,
     offline: u.connectionType === "offline",
-    // Näkyvyyskorjaus (Steve-skini)
+    // Invisibility Fix (Steve Skin)
     skinData: { DeviceOS: 11, DeviceId: crypto.randomUUID(), SkinId: "Standard_Steve", UIProfile: 0 }
   });
 
@@ -203,7 +204,7 @@ function actualConnect(uid, interaction) {
     manualStop: false,
     packetCount: 0,
     serverInfo: u.server,
-    // Fysiikkamoottorin tila
+    // Physics State
     pos: { x: 0, y: 0, z: 0 },
     vel: { x: 0, y: 0, z: 0 },
     yaw: 0, pitch: 0, targetYaw: 0, targetPitch: 0,
@@ -222,7 +223,6 @@ function actualConnect(uid, interaction) {
       if (!mc.entityId) return;
       session.tick++;
 
-      // Inhimillinen simulointi
       if (session.tick >= session.nextThink) {
         const r = Math.random();
         if (r < 0.4) {
@@ -281,12 +281,12 @@ function actualConnect(uid, interaction) {
   });
 
   mc.on("error", (e) => {
-    interaction.editReply(`❌ Connection error: ${e.message}`).catch(() => {});
+    interaction.editReply(`❌ Error: ${e.message}`).catch(() => {});
     stopSession(uid);
   });
 }
 
-// --- Discord Interaction Handler ---
+// ----------------- Interaction Handler -----------------
 client.on(Events.InteractionCreate, async (i) => {
   const uid = i.user.id;
   if (i.guildId !== ALLOWED_GUILD_ID) return;
@@ -331,13 +331,9 @@ client.on(Events.InteractionCreate, async (i) => {
       const now = Date.now();
       if (now - u.lastAdTime > AD_COOLDOWN_MS) {
         const result = await createLootLabsLink(uid);
-        
-        // TEKNINEN VIRHERAPORTOINTI
         if (result.error) {
-          const rawError = JSON.stringify(result.data, null, 2).slice(0, 1900);
-          return i.editReply({
-            content: `❌ **Failed to generate Reward Link.**\nTechnical Error: \`${result.error}\`\n\`\`\`json\n${rawError}\n\`\`\`\nPlease ensure Creator Details are filled in LootLabs.gg! 🥺`
-          });
+          const raw = JSON.stringify(result.data, null, 2).slice(0, 1900);
+          return i.editReply(`❌ **LootLabs API Error:** \`${result.error}\` \n\`\`\`json\n${raw}\n\`\`\``);
         }
 
         const adEmbed = new EmbedBuilder()
@@ -346,7 +342,7 @@ client.on(Events.InteractionCreate, async (i) => {
           .setDescription(
             "**We are sorry but this is to keep AFKBot up!** 🥺\n\n" +
             "Please complete the link wall to continue. This supports our hosting costs.\n\n" +
-            "**This will be prompted only once every 2 days.** 📅"
+            "**This will be prompted only once a 2 days.** 📅"
           )
           .setFooter({ text: "Thank you for supporting us!" });
 
@@ -363,16 +359,19 @@ client.on(Events.InteractionCreate, async (i) => {
 
     if (i.customId === "verify_ad") {
       await i.deferReply({ ephemeral: true });
-      const success = await verifyAdCompletion(uid);
+      const result = await verifyAdCompletion(uid);
       
-      if (success) {
+      if (result.success) {
         const u = getUser(uid);
         u.lastAdTime = Date.now();
         save();
-        await i.editReply("✅ Verification detected! Starting bot now... 🚀");
+        await i.editReply("✅ Verification detected! Starting bot... 🚀");
         return actualConnect(uid, i);
       } else {
-        return i.editReply("❌ **No conversion found.** Please reach the end of the LootLabs task. 🥺");
+        const debug = JSON.stringify(result.data || result.error || "No data", null, 2).slice(0, 1000);
+        return i.editReply({
+          content: `❌ **No conversion found yet.** Please ensure you reached the final page.\nDebug: \`\`\`json\n${debug}\n\`\`\``
+        });
       }
     }
 
@@ -397,18 +396,17 @@ client.on(Events.InteractionCreate, async (i) => {
   }
 });
 
-// --- Alustus ---
 client.once("ready", () => {
   client.application.commands.set([
     new SlashCommandBuilder().setName("panel").setDescription("User Control Panel"),
     new SlashCommandBuilder().setName("admin").setDescription("Admin System")
-      .addSubcommand(s => s.setName("info").setDescription("Stats & Diagnostics"))
-      .addSubcommand(s => s.setName("stop-all").setDescription("Force kill all bots"))
+      .addSubcommand(s => s.setName("info").setDescription("Stats"))
+      .addSubcommand(s => s.setName("stop-all").setDescription("Kill all bots"))
   ]);
   console.log(`✅ AFKBot Online: ${client.user.tag}`);
 });
 
-process.on("unhandledRejection", e => console.error("Unhandled Rejection:", e));
+process.on("unhandledRejection", e => console.error("Unhandled:", e));
 
 client.login(DISCORD_TOKEN);
 
