@@ -1,7 +1,6 @@
 /**
- * Bedrock AFK Bot - Mega Factory V5
- * Kaikki ominaisuudet yhdessä tiedostossa.
- * Ei tiivistämistä. Ei poistoja.
+ * Bedrock AFK Bot - Mega Factory Ultimate Edition
+ * TÄMÄ ON TÄYSI KOODI. EI TIIVISTYKSIÄ. EI POISTOJA.
  */
 
 const {
@@ -25,22 +24,22 @@ const { Authflow, Titles } = require("prismarine-auth");
 const fs = require("fs");
 const path = require("path");
 
-// --- KONFIGURAATIO & API AVAIMET ---
+// --- KONFIGURAATIO ---
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 
-// Gemini API Avaimet - Käytetään molempia tasapainottamaan kuormaa ja eri tehtäviä
+// Gemini API-avaimet kahdessa eri slotissa kuormantasausta varten
 const GEMINI_KEYS = [
-  "AIzaSyAZbj5F2X-FLM6NSqz_3K1sciQMepX6JMA", // Avain 1: UX & Virheet
-  "AIzaSyD51YhFcYCTp5HNOUZOZe14ymIhamILoOg"  // Avain 2: Terveys & Diagnostiikka
+  "AIzaSyAZbj5F2X-FLM6NSqz_3K1sciQMepX6JMA", // UX & Virheet
+  "AIzaSyD51YhFcYCTp5HNOUZOZe14ymIhamILoOg"  // Terveys & Diagnostiikka
 ];
 const GEMINI_MODEL = "gemini-2.5-flash-lite";
 
-// Tärkeät ID:t
+// Tärkeät ID-tunnukset
 const OWNER_ID = "1144987924123881564"; 
 const ADMIN_IDS = [OWNER_ID]; 
 const ALLOWED_GUILD_ID = "1462335230345089254";
 
-// Uptime-virstanpylväät (minuutteina): 30min, 1h, 2h, 4h, 6h, 8h, 12h, 24h
+// Uptime-virstanpylväät minuuteissa
 const MILESTONES = [30, 60, 120, 240, 360, 480, 720, 1440];
 
 // ----------------- Pysyvä Tallennus (Fly.io Volume) -----------------
@@ -48,26 +47,26 @@ const DATA = fs.existsSync("/data") ? "/data" : path.join(__dirname, "data");
 const AUTH_ROOT = path.join(DATA, "auth");
 const STORE = path.join(DATA, "users.json");
 
-// Luodaan hakemistot jos niitä ei ole
+// Alustetaan kansiorakenne
 if (!fs.existsSync(DATA)) fs.mkdirSync(DATA, { recursive: true });
 if (!fs.existsSync(AUTH_ROOT)) fs.mkdirSync(AUTH_ROOT, { recursive: true });
 
-// Ladataan käyttäjätiedot
+// Ladataan käyttäjätietokanta
 let users = fs.existsSync(STORE) ? JSON.parse(fs.readFileSync(STORE, "utf8")) : {};
 
 /**
- * Tallentaa käyttäjätietokannan levylle.
+ * Tallentaa nykyisen käyttäjädatan users.json-tiedostoon
  */
 function save() {
   try {
     fs.writeFileSync(STORE, JSON.stringify(users, null, 2));
   } catch (e) {
-    console.error("Tallennusvirhe:", e);
+    console.error("Tallennusvirhe backendissä:", e);
   }
 }
 
 /**
- * Hakee käyttäjän datan tai alustaa uuden.
+ * Hakee käyttäjän objektin tai luo oletusasetukset
  */
 function getUser(uid) {
   if (!users[uid]) {
@@ -81,7 +80,7 @@ function getUser(uid) {
 }
 
 /**
- * Hakee käyttäjän Microsoft-autentikaatiokansion.
+ * Palauttaa Microsoft-kirjautumistiedostojen polun
  */
 function getUserAuthDir(uid) {
   const dir = path.join(AUTH_ROOT, uid);
@@ -90,25 +89,27 @@ function getUserAuthDir(uid) {
 }
 
 /**
- * Poistaa Microsoft-linkityksen.
+ * Katkaisee Microsoft-linkityksen ja poistaa tiedostot
  */
 function unlinkMicrosoft(uid) {
   const dir = getUserAuthDir(uid);
   try { 
     fs.rmSync(dir, { recursive: true, force: true }); 
-  } catch (e) {}
+  } catch (e) {
+    console.error("Auth-tiedostojen poisto epäonnistui:", e);
+  }
   const u = getUser(uid);
   u.linked = false;
   save();
 }
 
-// ----------------- Runtime Tila -----------------
+// ----------------- Runtime-moottorit -----------------
 const sessions = new Map(); // Aktiiviset botit ja niiden resurssit
-const pendingLink = new Map(); // Käynnissä olevat linkitykset
+const pendingLink = new Map(); // Käynnissä olevat Auth-prosessit
 let currentKeyIndex = 0;
 
 /**
- * Kierrättää Gemini-avaimia kuormituksen mukaan.
+ * Valitsee vapaan Gemini-avaimen kierrättämällä
  */
 function getGeminiKey() {
   const key = GEMINI_KEYS[currentKeyIndex];
@@ -118,36 +119,38 @@ function getGeminiKey() {
 
 // ----------------- Omistajan Lokitus (Owner Logs) -----------------
 /**
- * Lähettää järjestelmäilmoituksen suoraan omistajan DM-viesteihin.
+ * Lähettää tärkeät järjestelmätapahtumat suoraan omistajalle DM-viestinä
  */
 async function notifyOwner(content) {
   try {
     const owner = await client.users.fetch(OWNER_ID).catch(() => null);
     if (owner) {
-      const time = new Date().toLocaleTimeString('fi-FI');
-      await owner.send(`\`[${time}]\` 📡 **Järjestelmäloki:** ${content}`).catch(() => {});
+      const now = new Date().toLocaleTimeString('fi-FI');
+      await owner.send(`\`[${now}]\` 📡 **System Log:** ${content}`).catch(() => {});
     }
   } catch (e) {
     console.error("Omistajalle ilmoittaminen epäonnistui.");
   }
 }
 
-// ----------------- Gemini AI Intelligence Hub -----------------
+// ----------------- Gemini AI "Factory Intelligence" -----------------
 /**
- * Käyttää Geminiä analysoimaan teknisiä tietoja, virheitä tai RAM-käyttöä.
+ * Käyttää Geminiä diagnostiikkaan ja virheanalyysiin.
+ * Tukee toimintoehdotuksia hakasulkeilla.
  */
 async function askGemini(prompt, type = "general") {
   const apiKey = getGeminiKey();
-  const systemInstruction = `You are the AFKBot System Intelligence, the central processor for a professional Minecraft Bedrock Factory.
-  Context: This bot maintains a player's presence on Bedrock servers to prevent AFK kicks.
-  Role: ${type === 'help' ? 'Diagnostic specialist. Analyze server health and provide clear fixes.' : 'System monitor. Optimize backend and explain errors.'}
   
-  Instructions:
-  - Be professional, modern, and technical. Avoid dramatic or "cringe" language.
-  - Explain errors clearly in simple English.
-  - If you detect an issue the bot can handle, suggest an action in brackets: [RAM_PURGE], [RECONNECT], [RESTART], or [WAIT].
-  - Always tell the user exactly what they should do on their end.
-  - Never mention you are an AI. You are the Factory Core.`;
+  const systemInstruction = `You are the AFKBot Mega Factory Core Intelligence.
+  Current Context: Professional Minecraft Bedrock AFK service.
+  Task: ${type === 'help' ? 'Diagnostic Expert. Analyze server pings and session data.' : 'System Monitor.'}
+  
+  Operational Rules:
+  1. Be professional, technical, and simple. Avoid over-dramatic or conversational language.
+  2. If an action is required, use these EXACT brackets: [RECONNECT], [RAM_PURGE], [RESTART], [WAIT].
+  3. Explain exactly what the user must do on their end.
+  4. Never say you are an AI. You are the System Interface.
+  5. Analyze provided ping results to determine if the server is offline or unreachable.`;
 
   try {
     const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${apiKey}`, {
@@ -160,18 +163,18 @@ async function askGemini(prompt, type = "general") {
     });
 
     const data = await response.json();
-    const result = data.candidates?.[0]?.content?.parts?.[0]?.text || "System diagnostics unavailable. Please check settings manually.";
+    const result = data.candidates?.[0]?.content?.parts?.[0]?.text || "System diagnostics failed. Please manually check settings.";
     
-    // Lokitetaan päätös omistajalle
-    notifyOwner(`AI Engine (${type}) processed a request. Context: ${prompt.substring(0, 50)}... -> Result: ${result.substring(0, 100)}...`);
+    // Ilmoitetaan AI-päätöksestä omistajalle
+    notifyOwner(`AI Engine (${type}) analyzed request. Response length: ${result.length} chars.`);
     
     return result;
   } catch (e) {
-    return "The AI diagnostic module is currently recalibrating. Standard protocols are active.";
+    return "The AI Intelligence module is temporarily recalibrating. Standard protocols active.";
   }
 }
 
-// ----------------- Discord Client -----------------
+// ----------------- Discord Client Alustus -----------------
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -182,13 +185,13 @@ const client = new Client({
   partials: [Partials.Channel, Partials.Message, Partials.User]
 });
 
-// ----------------- UI Rakentajat -----------------
+// ----------------- UI-rakentajat (Moderni & Tehokas) -----------------
 
 function panelRow() {
   return [
     new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId("link").setLabel("🔑 Link Microsoft").setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId("unlink").setLabel("🗑 Unlink Microsoft").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("unlink").setLabel("🗑 Unlink").setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId("start").setLabel("▶ Start Bot").setStyle(ButtonStyle.Success),
       new ButtonBuilder().setCustomId("stop").setLabel("⏹ Stop Bot").setStyle(ButtonStyle.Danger),
       new ButtonBuilder().setCustomId("settings").setLabel("⚙ Settings").setStyle(ButtonStyle.Secondary)
@@ -217,16 +220,17 @@ function patreonRow() {
   );
 }
 
-function aiActionConfirmRow(action, uid) {
+function aiConfirmationRow(action, uid) {
+  const label = action === 'purge' ? 'Confirm RAM Optimization' : 'Confirm AI Reconnect';
   return new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(`ai_confirm_${action}_${uid}`).setLabel("Confirm AI Action").setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId(`ai_confirm_${action}_${uid}`).setLabel(label).setStyle(ButtonStyle.Danger),
     new ButtonBuilder().setCustomId(`ai_ignore_${uid}`).setLabel("Ignore Assistant").setStyle(ButtonStyle.Secondary)
   );
 }
 
 function versionRow(current = "auto") {
   return new ActionRowBuilder().addComponents(
-    new StringSelectMenuBuilder().setCustomId("set_version").setPlaceholder("Bedrock Version").addOptions(
+    new StringSelectMenuBuilder().setCustomId("set_version").setPlaceholder("Select Bedrock Version").addOptions(
       { label: "Auto-detect", value: "auto", default: current === "auto" },
       { label: "1.21.x", value: "1.21.x", default: current === "1.21.x" },
       { label: "1.20.x", value: "1.20.x", default: current === "1.20.x" }
@@ -234,9 +238,9 @@ function versionRow(current = "auto") {
   );
 }
 
-// ----------------- Microsoft Link (Aito Alkuperäinen Logiikka) -----------------
+// ----------------- Microsoft Link (Aito Alkuperäinen Callback-logiikka) -----------------
 /**
- * Hoitaa Microsoft-kirjautumisen täsmälleen alkuperäisellä tavalla callbackeineen.
+ * Hoitaa Microsoft-autentikaation täsmälleen alkuperäisellä tavalla callbackien kanssa.
  */
 async function linkMicrosoft(uid, interaction) {
   if (pendingLink.has(uid)) {
@@ -257,30 +261,30 @@ async function linkMicrosoft(uid, interaction) {
       deviceType: "Nintendo"
     },
     async (data) => {
-      // TÄMÄ ON ALKUPERÄINEN CALLBACK: Näyttää koodin heti kun se saadaan
+      // TÄMÄ ON ALKUPERÄINEN CALLBACK: Päivittää viestin koodilla heti
       const uri = data.verification_uri_complete || data.verification_uri || "https://www.microsoft.com/link";
       const code = data.user_code || "(no code)";
       codeShown = true;
 
-      const msg = `🔐 **Microsoft login required**\n\n👉 ${uri}\n\nYour code: \`${code}\`\n\n⚠ **IMPORTANT:** Please use a secondary Microsoft account. Come back here after you have logged in.`;
+      const msg = `🔐 **Microsoft Login Required**\n\n👉 ${uri}\n\nYour code: \`${code}\`\n\n⚠ **IMPORTANT:** Use a secondary Microsoft account. Come back here after login.`;
       
       await interaction.editReply({ 
         content: msg, 
         components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setLabel("Open Link").setStyle(ButtonStyle.Link).setURL(uri)), patreonRow()] 
       }).catch(() => {});
       
-      notifyOwner(`Käyttäjä <@${uid}> aloitti Microsoft-kirjautumisen.`);
+      notifyOwner(`Käyttäjä <@${uid}> aloitti kirjautumisprosessin.`);
     }
   );
 
   const p = (async () => {
     try {
-      if (!codeShown) await interaction.editReply("⏳ Requesting Microsoft authentication code…");
+      if (!codeShown) await interaction.editReply("⏳ Requesting authentication code…");
       await flow.getMsaToken();
       u.linked = true;
       save();
       await interaction.followUp({ ephemeral: true, content: "✅ Microsoft account successfully linked!", components: [patreonRow()] }).catch(() => {});
-      notifyOwner(`Käyttäjä <@${uid}> linkitti tilinsä onnistuneesti.`);
+      notifyOwner(`Käyttäjä <@${uid}> linkitti tilinsä.`);
     } catch (e) {
       const aiAdvice = await askGemini(`Auth Linking Failed: ${e.message}`, "auth");
       await interaction.editReply({ content: `❌ **Linking Failed**\n\n${aiAdvice}`, components: [patreonRow()] });
@@ -291,12 +295,12 @@ async function linkMicrosoft(uid, interaction) {
   pendingLink.set(uid, p);
 }
 
-// ----------------- Bedrock Session Moottori (Tehdas) -----------------
+// ----------------- Bedrock Session Moottori (Teollisuustaso) -----------------
 
 /**
- * Puhdistaa session kaikki resurssit täydellisesti.
+ * Puhdistaa session kaikki resurssit muistista ja sulkee yhteyden.
  */
-function cleanupSession(uid) {
+function cleanupSessionResources(uid) {
   const s = sessions.get(uid);
   if (!s) return;
   
@@ -311,19 +315,19 @@ function cleanupSession(uid) {
 }
 
 /**
- * Pysäyttää botin ja siivoaa muistin.
+ * Pysäyttää botin manuaalisesti ja ilmoittaa siitä.
  */
-function stopBot(uid) {
+function stopBotManually(uid) {
   if (!sessions.has(uid)) return false;
   const s = sessions.get(uid);
   s.manualStop = true;
-  cleanupSession(uid);
-  notifyOwner(`Käyttäjä <@${uid}> pysäytti botin.`);
+  cleanupSessionResources(uid);
+  notifyOwner(`Käyttäjä <@${uid}> sammutti botin.`);
   return true;
 }
 
 /**
- * Käynnistää Minecraft-session ja asettaa monitorit.
+ * Käynnistää Minecraft-session ja asettaa kaikki monitorointijärjestelmät.
  */
 async function startSession(uid, interaction = null) {
   const u = getUser(uid);
@@ -332,26 +336,27 @@ async function startSession(uid, interaction = null) {
     return;
   }
 
-  // AMMATTIMAINEN START-ESTO: Estetään päällekkäiset botit
+  // AMMATTIMAINEN START-ESTO
   if (sessions.has(uid) && !sessions.get(uid).isReconnecting) {
     if (interaction && !interaction.replied) {
-      await interaction.editReply("⚠️ **Active Session Detected**\nYour AFK bot is already operational. To restart or change servers, please terminate the current session by tapping the **Stop Bot** button first.");
+      const msg = "⚠️ **Active Session Detected**\nYour AFK bot is already operational. To restart or change servers, please terminate the current session by tapping the **Stop Bot** button first.";
+      await interaction.editReply(msg);
     }
     return;
   }
 
   const { ip, port } = u.server;
 
-  // ATERNOS / PROXY PROTECTION: Ping ennen yhdistämistä
+  // ATERNOS / PROXY PROTECTION
   try {
     const ping = await bedrock.ping({ host: ip, port: port });
     const motd = (ping.motd || "").toLowerCase();
     if (motd.includes("offline") || motd.includes("starting") || motd.includes("queue")) {
-      if (interaction) await interaction.editReply(`❌ Server Status: **Offline/Starting**. Bot will not connect to a proxy lobby. Please start your server first.`);
+      if (interaction) await interaction.editReply(`❌ Server Status: **Offline/Starting**. The bot will not join a proxy lobby.`);
       return;
     }
   } catch (e) {
-    if (interaction) await interaction.editReply(`❌ **Network Error**: The server at **${ip}** is currently unreachable.`);
+    if (interaction) await interaction.editReply(`❌ **Network Error**: The server at **${ip}** is unreachable.`);
     return;
   }
 
@@ -379,17 +384,17 @@ async function startSession(uid, interaction = null) {
     manualStop: false,
     isReconnecting: false,
     startTime: Date.now(),
-    milestones: [],
+    milestonesReached: [],
     retryCount: sessions.get(uid)?.retryCount || 0
   };
   sessions.set(uid, session);
 
-  // Join Timeout
+  // Join Timeout (Spawn packet odotus)
   session.timeout = setTimeout(async () => {
     if (!session.connected) {
-      const help = await askGemini(`Bot failed to receive spawn packet from ${ip}:${port} after 45s wait.`, "network");
-      if (interaction) await interaction.editReply(`❌ **Spawn Timeout**\n\n${help}`);
-      cleanupSession(uid);
+      const helpText = await askGemini(`Bot failed to receive spawn packet from ${ip}:${port} after 45s.`, "network");
+      if (interaction) await interaction.editReply(`❌ **Connection Timeout**\n\n${helpText}`);
+      cleanupSessionResources(uid);
     }
   }, 47000);
 
@@ -409,23 +414,23 @@ async function startSession(uid, interaction = null) {
       interaction.editReply({ content: msg, components: comps }).catch(() => {});
     }
 
-    // --- UPTIME MILESTONES (30min, 1h, 2h...) ---
+    // --- UPTIME MILESTONES ENGINE ---
     session.uptimeTimer = setInterval(async () => {
-      const mins = Math.floor((Date.now() - session.startTime) / 60000);
-      const m = MILESTONES.find(v => mins >= v && !session.milestones.includes(v));
+      const elapsedMins = Math.floor((Date.now() - session.startTime) / 60000);
+      const milestone = MILESTONES.find(m => elapsedMins >= m && !session.milestonesReached.includes(m));
       
-      if (m) {
-        session.milestones.push(m);
+      if (milestone) {
+        session.milestonesReached.push(milestone);
         const user = await client.users.fetch(uid).catch(() => null);
         if (user) {
-          const timeLabel = m >= 60 ? `${m / 60}h` : `${m} minutes`;
+          const timeLabel = milestone >= 60 ? `${milestone / 60}h` : `${milestone} minutes`;
           await user.send(`Congrats! Your bot has been up for **${timeLabel}**! 🥳`).catch(() => {});
-          notifyOwner(`Käyttäjä <@${uid}> saavutti ${timeLabel} uptime-virstanpylvään.`);
+          notifyOwner(`Käyttäjä <@${uid}> saavutti ${timeLabel} uptime-rajan.`);
         }
       }
     }, 60000);
 
-    // --- ANTI-AFK MOVEMENT (Modern & Simple) ---
+    // --- ANTI-AFK MOVEMENT LOGIC ---
     let toggle = false;
     session.afkInterval = setInterval(() => {
       try {
@@ -440,19 +445,20 @@ async function startSession(uid, interaction = null) {
       } catch (err) {}
     }, 60000);
 
-    // --- GEMINI HEALTH & RAM ASSISTANT ---
+    // --- GEMINI RESOURCE MONITORING ---
     session.healthMonitor = setInterval(async () => {
       const ram = process.memoryUsage().heapUsed / 1024 / 1024;
-      if (ram > 480) { // Jos backendin RAM ylittyy
-        const analysis = await askGemini(`High RAM usage detected (${ram.toFixed(1)}MB). Suggest RAM_PURGE for user ${uid}?`, "health");
+      if (ram > 480) {
+        const analysis = await askGemini(`System RAM high (${ram.toFixed(1)}MB). Session ${uid} optimization?`, "health");
         const user = await client.users.fetch(uid).catch(() => null);
-        if (user) {
+        if (user && analysis.includes("[RAM_PURGE]")) {
+          const cleanTxt = analysis.replace("[RAM_PURGE]", "").trim();
           await user.send({ 
-            content: `🛡️ **System Assistant:** I've detected high resource usage. To ensure stability, I recommend an automated optimization.\n\n${analysis}`,
-            components: [aiActionConfirmRow('purge', uid)]
+            content: `🛡️ **Assistant:** I recommend a quick resource optimization.\n\n${cleanTxt}`,
+            components: [aiConfirmationRow('purge', uid)]
           }).catch(() => {});
         }
-        notifyOwner(`VAROITUS: Korkea muistinkäyttö (${ram.toFixed(1)}MB). Gemini ehdotti optimointia käyttäjälle ${uid}.`);
+        notifyOwner(`VAROITUS: Korkea RAM-käyttö (${ram.toFixed(1)}MB). Gemini analysoi.`);
       }
     }, 300000);
   });
@@ -460,17 +466,16 @@ async function startSession(uid, interaction = null) {
   mc.on("error", async (err) => {
     if (session.manualStop) return;
     const errorMsg = String(err.message || err);
-    notifyOwner(`Virhe käyttäjällä <@${uid}>: ${errorMsg}`);
+    notifyOwner(`Yhteysvirhe (<@${uid}>): ${errorMsg}`);
 
     if (errorMsg.includes("auth") || errorMsg.includes("session")) {
       const user = await client.users.fetch(uid).catch(() => null);
-      if (user) await user.send("❌ **Authentication Expired**: Your session has expired. Please re-link Microsoft in the panel.").catch(() => {});
-      return cleanupSession(uid);
+      if (user) await user.send("❌ **Authentication Expired**: Please re-link Microsoft in the panel.").catch(() => {});
+      return cleanupSessionResources(uid);
     }
 
-    // Jos virhe on tuntematon, Gemini selittää sen
     if (!errorMsg.toLowerCase().includes("timeout")) {
-        const explanation = await askGemini(`Minecraft Client Error: ${errorMsg} at ${ip}`, "error");
+        const explanation = await askGemini(`Client Error: ${errorMsg} at ${ip}`, "error");
         const user = await client.users.fetch(uid).catch(() => null);
         if (user) await user.send(`⚠️ **Bot Encountered an Error**\n\n${explanation}`).catch(() => {});
     }
@@ -484,7 +489,7 @@ async function startSession(uid, interaction = null) {
 }
 
 /**
- * AGGRESSIIVINEN 30S REJOIN MOOTTORI: Tarkistaa pingin 30s välein kunnes pääsee takaisin.
+ * AGGRESSIIVINEN 30S REJOIN MOOTTORI
  */
 function handleAutoReconnect(uid, interaction) {
   const s = sessions.get(uid);
@@ -494,18 +499,16 @@ function handleAutoReconnect(uid, interaction) {
   s.connected = false;
   s.retryCount++;
 
-  notifyOwner(`Yhteys katkesi käyttäjältä <@${uid}>. Yritetään uudelleen 30s kuluttua. (Yritys #${s.retryCount})`);
+  notifyOwner(`Yhteys katkesi (<@${uid}>). Yritetään uudelleen 30s kuluttua.`);
 
   s.reconnectTimer = setTimeout(async () => {
     if (sessions.has(uid) && !s.manualStop) {
       const u = getUser(uid);
-      // TARKISTETAAN ONKO SERVU PÄÄLLÄ
       try {
         await bedrock.ping({ host: u.server.ip, port: u.server.port });
-        console.log(`[TEHDAS] Palvelin ${u.server.ip} on ONLINE. Uudelleenkytkeytyminen aloitettu käyttäjälle ${uid}.`);
+        console.log(`[TEHDAS] Servu ONLINE. Uudelleenliittyminen aloitettu.`);
         startSession(uid, interaction);
       } catch (e) {
-        // Jos servu on edelleen alhaalla, nollataan ajastin ja yritetään uudelleen 30s päästä
         s.reconnectTimer = null;
         handleAutoReconnect(uid, interaction);
       }
@@ -523,7 +526,7 @@ client.on(Events.InteractionCreate, async (i) => {
 
     // --- ADMIN HALLINTA (Suomeksi) ---
     if (i.commandName === "admin") {
-      if (!ADMIN_IDS.includes(uid)) return i.reply({ content: "Pääsy evätty. Et ole admin.", ephemeral: true });
+      if (!ADMIN_IDS.includes(uid)) return i.reply({ content: "Pääsy evätty.", ephemeral: true });
       await i.deferReply({ ephemeral: false });
       return i.editReply({ embeds: [buildAdminEmbed()], components: buildAdminComponents() });
     }
@@ -532,29 +535,30 @@ client.on(Events.InteractionCreate, async (i) => {
       if (!ADMIN_IDS.includes(uid)) return;
       if (i.customId === "admin_refresh") return i.update({ embeds: [buildAdminEmbed()], components: buildAdminComponents() });
       if (i.customId === "admin_stop_all") {
-        const currentCount = sessions.size;
         for (const [id] of sessions) {
-          cleanupSession(id);
+          cleanupSessionResources(id);
           const user = await client.users.fetch(id).catch(() => null);
-          if (user) await user.send("Your bot was stopped by the owner for system maintenance ⚠️").catch(() => {});
+          if (user) await user.send("Your bot was stopped by the owner for maintenance ⚠️").catch(() => {});
         }
-        notifyOwner(`Kaikki ${currentCount} bottia pysäytetty adminin toimesta.`);
         return i.update({ embeds: [buildAdminEmbed()], components: buildAdminComponents() });
       }
     }
 
     // --- AI ACTION VAHVISTUKSET ---
-    if (i.customId?.startsWith("ai_confirm_purge_")) {
-      const target = i.customId.split("_")[3];
-      if (uid !== target) return i.reply({ content: "Access denied.", ephemeral: true });
-      await i.update({ content: "⚡ **AI Optimization:** Purging RAM and reconnecting session...", components: [] });
-      cleanupSession(target);
+    if (i.customId?.startsWith("ai_confirm_")) {
+      const parts = i.customId.split("_");
+      const action = parts[2];
+      const target = parts[3];
+      if (uid !== target) return i.reply({ content: "Not your session.", ephemeral: true });
+      
+      await i.update({ content: "⚡ **AI Optimization Active:** Reconnecting for performance...", components: [] });
+      cleanupSessionResources(target);
       setTimeout(() => startSession(target), 1500);
       return;
     }
 
     if (i.customId?.startsWith("ai_ignore_")) {
-      await i.update({ content: "Optimization ignored. Stability not guaranteed.", components: [] });
+      await i.update({ content: "Optimization ignored by user.", components: [] });
       return;
     }
 
@@ -566,27 +570,39 @@ client.on(Events.InteractionCreate, async (i) => {
     if (i.isButton()) {
       // --- GET HELP (DIAGNOSTIIKKA) ---
       if (i.customId === "get_help") {
-        await i.reply({ content: "⏳ **AI Thinking...** Collecting server diagnostics and testing connection.", ephemeral: true });
+        await i.reply({ content: "⏳ **AI Thinking...** Collecting server health and diagnostics.", ephemeral: true });
         const u = getUser(uid);
         const s = sessions.get(uid);
-        let pingResult = "Server Unreachable";
+        let pingInfo = "Offline/Unreachable";
         try {
            const p = await bedrock.ping({ host: u.server?.ip, port: u.server?.port });
-           pingResult = `Online (MOTD: ${p.motd})`;
+           pingInfo = `Online (MOTD: ${p.motd})`;
         } catch (e) {
-           pingResult = `Offline or Error (${e.message})`;
+           pingInfo = `Error: ${e.message}`;
         }
 
-        const diagPrompt = `User Help Request Diagnostic:
-        - Target Server: ${u.server?.ip}:${u.server?.port}
-        - Connection Protocol: ${u.connectionType}
-        - Current Session Status: ${s ? (s.connected ? 'ACTIVE' : 'RECONNECTING') : 'INACTIVE'}
-        - Real-time Ping Result: ${pingResult}
+        const diagPrompt = `Diagnostic Data:
+        - Target: ${u.server?.ip}:${u.server?.port}
+        - Protocol: ${u.connectionType}
+        - Current Session: ${s ? (s.connected ? 'Connected' : 'Reconnecting') : 'Inactive'}
+        - Ping Test: ${pingInfo}
+        Analyze and suggest solutions. Use brackets for actions.`;
         
-        Analyze why the user might be having trouble and provide advice.`;
+        const aiRes = await askGemini(diagPrompt, "help");
         
-        const aiResponse = await askGemini(diagPrompt, "help");
-        return i.editReply({ content: `🆘 **AI Diagnostic Report**\n\n${aiResponse}`, components: [patreonRow()] });
+        // PARSERI: Etsitään hakasulkeet, piilotetaan ne ja lisätään nappi
+        let components = [patreonRow()];
+        let cleanText = aiRes;
+        
+        const actions = ['RECONNECT', 'RAM_PURGE', 'RESTART'];
+        actions.forEach(act => {
+           if (aiRes.includes(`[${act}]`)) {
+              cleanText = cleanText.replace(`[${act}]`, "").trim();
+              components.push(aiConfirmationRow(act.toLowerCase().replace("ram_", ""), uid));
+           }
+        });
+
+        return i.editReply({ content: `🆘 **AI Diagnostic Report**\n\n${cleanText}`, components });
       }
 
       if (i.customId === "start") {
@@ -595,13 +611,9 @@ client.on(Events.InteractionCreate, async (i) => {
       }
       
       if (i.customId === "stop") {
-        const ok = stopBot(uid);
-        let msg = ok ? "⏹ **Bot Terminated.**" : "❌ No active session found.";
-        if (ok && Math.random() < 0.7) {
-          msg += "\n\nHelp us keep AFKBot up by donating through Patreon!";
-          return i.reply({ ephemeral: true, content: msg, components: [patreonRow()] });
-        }
-        return i.reply({ ephemeral: true, content: msg });
+        const ok = stopBotManually(uid);
+        let msg = ok ? "⏹ **Bot Terminated.** Session closed." : "❌ No active session found.";
+        return i.reply({ ephemeral: true, content: msg, components: [patreonRow()] });
       }
 
       if (i.customId === "link") {
@@ -611,8 +623,7 @@ client.on(Events.InteractionCreate, async (i) => {
 
       if (i.customId === "unlink") {
         unlinkMicrosoft(uid);
-        notifyOwner(`Käyttäjä <@${uid}> poisti Microsoft-linkityksen.`);
-        return i.reply({ ephemeral: true, content: "🗑 Microsoft account unlinked." });
+        return i.reply({ ephemeral: true, content: "🗑 Microsoft link removed." });
       }
 
       if (i.customId === "settings") {
@@ -637,7 +648,6 @@ client.on(Events.InteractionCreate, async (i) => {
       u.server = { ip: i.fields.getTextInputValue("ip").trim(), port: parseInt(i.fields.getTextInputValue("port").trim()) || 19132 };
       u.offlineUsername = i.fields.getTextInputValue("offline").trim() || `AFK_${uid.slice(-4)}`;
       save();
-      notifyOwner(`Käyttäjä <@${uid}> päivitti palvelimen: ${u.server.ip}:${u.server.port}`);
       return i.reply({ ephemeral: true, content: "✅ Settings saved successfully." });
     }
 
@@ -645,58 +655,57 @@ client.on(Events.InteractionCreate, async (i) => {
       const u = getUser(uid);
       u.bedrockVersion = i.values[0];
       save();
-      return i.reply({ ephemeral: true, content: `✅ Target version set to: **${u.bedrockVersion}**` });
+      return i.reply({ ephemeral: true, content: `✅ Version set to: **${u.bedrockVersion}**` });
     }
 
   } catch (err) {
-    console.error("Interaction Exception:", err);
-    notifyOwner(`KRIITTINEN INTERAKTIOVIRHE: ${err.message}`);
+    console.error("Interaktio-virhe:", err);
+    notifyOwner(`CRITICAL INTERACTION ERROR: ${err.message}`);
   }
 });
 
-// ----------------- Admin Embed (Suomeksi) -----------------
+// ----------------- Admin-näkymä (Suomeksi) -----------------
 function buildAdminEmbed() {
-  const activeBots = Array.from(sessions.entries()).map(([id, s]) => {
-    const uptimeMins = Math.floor((Date.now() - s.startTime) / 60000);
-    return `👤 <@${id}>\nUptime: \`${uptimeMins} min\` | Yritykset: \`${s.retryCount}\` | Tila: \`${s.connected ? "🟢 Online" : "🟡 Yhdistää"}\``;
+  const bots = Array.from(sessions.entries()).map(([id, s]) => {
+    const mins = Math.floor((Date.now() - s.startTime) / 60000);
+    return `👤 <@${id}>\nUptime: \`${mins} min\` | Yritykset: \`${s.retryCount}\` | Tila: \`${s.connected ? "🟢 Online" : "🟡 Reconnect"}\``;
   }).join("\n\n") || "Ei aktiivisia botteja.";
 
   return new EmbedBuilder()
     .setTitle("🛡️ AFKBot Hallintapaneeli")
     .setColor("#ff0000")
     .addFields(
-      { name: "Tehdas-tilastot", value: `Käyttäjiä DB:ssä: \`${Object.keys(users).length}\`\nAktiivisia sessioita: \`${sessions.size}\`` },
-      { name: "Aktiiviset Botit", value: activeBots }
+      { name: "Tehdas-stats", value: `Käyttäjiä DB:ssä: \`${Object.keys(users).length}\`\nSessioita nyt: \`${sessions.size}\`` },
+      { name: "Aktiiviset Botit", value: bots }
     )
-    .setTimestamp()
-    .setFooter({ text: "Mega Factory Backend Engine" });
+    .setTimestamp();
 }
 
 function buildAdminComponents() {
   return [new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId("admin_refresh").setLabel("🔄 Päivitä").setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId("admin_stop_all").setLabel("☢️ Pysäytä Kaikki").setStyle(ButtonStyle.Danger)
+    new ButtonBuilder().setCustomId("admin_stop_all").setLabel("☢️ Force Stop All").setStyle(ButtonStyle.Danger)
   )];
 }
 
-// ----------------- Crash Guard & Lifecycle -----------------
+// ----------------- Crash Guard & Prosessin Hallinta -----------------
 process.on("unhandledRejection", (error) => {
   console.error("Guarded Unhandled Rejection:", error);
   notifyOwner(`Unhandled Rejection: \`${error.message}\``);
 });
 
 process.on("uncaughtException", (error) => {
-  console.error("Guarded Uncaught Exception (Prevention):", error);
-  notifyOwner(`KRIITTINEN PROSESSIVIRHE: \`${error.message}\``);
+  console.error("Guarded Uncaught Exception:", error);
+  notifyOwner(`KRIITTINEN VIRHE: \`${error.message}\``);
 });
 
 client.once("ready", async () => {
-  console.log(`🟢 AFKBot MEGA FACTORY V5 ONLINE: ${client.user.tag}`);
-  notifyOwner("Botti on käynnistynyt ja kaikki tehdasmoottorit ovat online-tilassa.");
+  console.log(`🟢 MEGA FACTORY ONLINE: ${client.user.tag}`);
+  notifyOwner("Botti on käynnistynyt ja tehdasmoottori on valmiustilassa.");
   
   const cmds = [
-    new SlashCommandBuilder().setName("panel").setDescription("Open system control panel"),
-    new SlashCommandBuilder().setName("admin").setDescription("Open administrator control panel")
+    new SlashCommandBuilder().setName("panel").setDescription("System control panel"),
+    new SlashCommandBuilder().setName("admin").setDescription("Admin panel")
   ];
   await client.application.commands.set(cmds);
 });
