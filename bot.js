@@ -24,12 +24,13 @@ if (!DISCORD_TOKEN) {
   process.exit(1);
 }
 
-// --- ADMIN MÄÄRITYKSET ---
+// --- ADMIN CONFIGURATION ---
 // VAIHDA TÄHÄN OMA DISCORD ID:SI
-const ADMIN_IDS = ["1144987924123881564"];
+const ADMIN_IDS = ["YOUR_DISCORD_ID_HERE"];
 const ALLOWED_GUILD_ID = "1462335230345089254";
 
 // ----------------- Storage (Fly.io Volume & Persistence) -----------------
+// Tarkistetaan onko /data volume olemassa, jotta tokenit pysyvät deployn yli
 const DATA = fs.existsSync("/data") ? "/data" : path.join(__dirname, "data");
 const AUTH_ROOT = path.join(DATA, "auth");
 const STORE = path.join(DATA, "users.json");
@@ -123,7 +124,7 @@ function patreonRow() {
 }
 
 function shouldShowPatreon() {
-  return Math.random() < 0.7; // ~70% mahdollisuus näyttää lahjoitusviesti
+  return Math.random() < 0.7; // ~70% mahdollisuus
 }
 
 function versionRow(current = "auto") {
@@ -150,7 +151,7 @@ function connRow(current = "online") {
   return new ActionRowBuilder().addComponents(menu);
 }
 
-// ----------------- Admin Panel Toiminnot -----------------
+// ----------------- Admin Panel Logic -----------------
 function buildAdminEmbed() {
     const activeSessions = sessions.size;
     const totalUsersInDb = Object.keys(users).length;
@@ -159,29 +160,25 @@ function buildAdminEmbed() {
     const activeUids = Array.from(sessions.keys());
     
     if (activeUids.length === 0) {
-        activeBotsText = "No active bots currently.";
+        activeBotsText = "Ei aktiivisia botteja.";
     } else {
         activeUids.forEach(uid => {
             const u = users[uid];
             const s = sessions.get(uid);
-            const status = s.connected ? "🟢 Online" : "🟡 Reconnecting";
-            const ip = u.server?.ip || "Unknown";
-            const port = u.server?.port || "19132";
-            
-            activeBotsText += `👤 <@${uid}>\n📍 \`${ip}:${port}\` | ${status}\n\n`;
+            const status = s.connected ? "🟢 Online" : "🟡 Yhdistää...";
+            activeBotsText += `👤 <@${uid}>\n📍 \`${u.server?.ip || "N/A"}:${u.server?.port || "19132"}\` | ${status}\n\n`;
         });
     }
 
     return new EmbedBuilder()
         .setTitle("🛡️ AFKBot Admin Control Panel")
-        .setDescription("Real-time server monitoring.")
         .setColor("#ff0000")
         .addFields(
-            { name: "📊 Global Statistics", value: `Total users: \`${totalUsersInDb}\`\nActive sessions: \`${activeSessions}\``, inline: false },
-            { name: "🤖 Active Bots List", value: activeBotsText || "None", inline: false }
+            { name: "📊 Tilastot", value: `Käyttäjiä: \`${totalUsersInDb}\` | Aktiivisia: \`${activeSessions}\``, inline: false },
+            { name: "🤖 Aktiiviset botit", value: activeBotsText || "Ei tietoja", inline: false }
         )
         .setTimestamp()
-        .setFooter({ text: "Updates automatically every 30s" });
+        .setFooter({ text: "Päivittyy automaattisesti 30s välein" });
 }
 
 function buildAdminComponents() {
@@ -194,32 +191,71 @@ function buildAdminComponents() {
 
     if (sessions.size > 0) {
         const options = Array.from(sessions.keys()).map(uid => ({
-            label: `Stop bot for user ${uid}`,
+            label: `Pysäytä käyttäjä ${uid}`,
             value: uid,
-            description: `IP: ${sessions.get(uid).client?.options?.host || "unknown"}`
+            description: `Server: ${sessions.get(uid).client?.options?.host || "unknown"}`
         }));
-
         const selectMenu = new StringSelectMenuBuilder()
             .setCustomId("admin_stop_user")
-            .setPlaceholder("Select a bot to terminate")
+            .setPlaceholder("Valitse botti sammutettavaksi")
             .addOptions(options.slice(0, 25));
-
         rows.push(new ActionRowBuilder().addComponents(selectMenu));
     }
-
     return rows;
 }
 
-async function stopAndNotifyAdminAction(uid) {
-    stopSession(uid);
-    try {
-        const user = await client.users.fetch(uid);
-        if (user) {
-            await user.send("Your bot has been stopped by the owner ⚠️").catch(() => {});
-        }
-    } catch (e) {
-        console.error(`DM failed for user ${uid}`);
+// ----------------- Microsoft link (EXACT ORIGINAL LOGIC) -----------------
+async function linkMicrosoft(uid, interaction) {
+  if (pendingLink.has(uid)) {
+    await interaction.editReply("⏳ Login already in progress. Use the last code.");
+    return;
+  }
+
+  const authDir = getUserAuthDir(uid);
+  const u = getUser(uid);
+  let codeShown = false;
+
+  const flow = new Authflow(
+    uid,
+    authDir,
+    {
+      flow: "live",
+      authTitle: Titles?.MinecraftNintendoSwitch || "Bedrock AFK Bot",
+      deviceType: "Nintendo"
+    },
+    async (data) => {
+      const uri = data.verification_uri_complete || data.verification_uri || "https://www.microsoft.com/link";
+      const code = data.user_code || "(no code)";
+      lastMsa.set(uid, { uri, code, at: Date.now() });
+      codeShown = true;
+
+      const msg =
+        `🔐 **Microsoft login required**\n\n` +
+        `👉 ${uri}\n\n` +
+        `Your code: \`${code}\`\n\n` +
+        `⚠ **IMPORTANT:** Use a *second* Microsoft account.\n` +
+        `Do **NOT** use the account you normally play with.\n\n` +
+        `Come back here after login.`;
+
+      await interaction.editReply({ content: msg, components: msaComponents(uri) }).catch(() => {});
     }
+  );
+
+  const p = (async () => {
+    try {
+      if (!codeShown) await interaction.editReply("⏳ Requesting Microsoft login code…");
+      await flow.getMsaToken();
+      u.linked = true;
+      save();
+      await interaction.followUp({ ephemeral: true, content: "✅ Microsoft account linked!" }).catch(() => {});
+    } catch (e) {
+      await interaction.editReply(`❌ Microsoft login failed:\n${String(e?.message || e)}`).catch(() => {});
+    } finally {
+      pendingLink.delete(uid);
+    }
+  })();
+
+  pendingLink.set(uid, p);
 }
 
 // ----------------- Bedrock session -----------------
@@ -243,33 +279,39 @@ function stopSession(uid) {
 async function startSession(uid, interaction) {
   const u = getUser(uid);
   if (!u.server) {
-    if (interaction) await interaction.editReply("⚠ Set settings first.");
+    if (interaction && !interaction.replied) interaction.editReply("⚠ Set settings first.");
     return;
   }
   
+  // Jos sessio on jo käynnissä eikä se ole uudelleenkytkentävaiheessa, estetään tuplakäynnistys
   const existing = sessions.get(uid);
   if (existing && !existing.isReconnecting) {
-    if (interaction) await interaction.editReply("⚠ You already have a running bot.");
+    if (interaction && !interaction.replied) interaction.editReply("⚠ You already have a running bot.");
     return;
   }
 
   const { ip, port } = u.server;
 
-  // Aternos Proxy Protection
+  // --- Aternos/Proxy Protection ---
   try {
     const pingData = await bedrock.ping({ host: ip, port: port });
     const motd = (pingData.motd || "").toLowerCase();
     if (motd.includes("offline") || motd.includes("starting") || motd.includes("queue")) {
-        if (interaction) await interaction.editReply(`❌ Server is currently **Offline** or **Starting**. Bot will not join the proxy lobby.`);
+        if (interaction) interaction.editReply(`❌ Server is currently **Offline** or **Starting**. Bot will not join the proxy lobby.`).catch(() => {});
         return;
     }
   } catch (e) {
-    if (interaction) await interaction.editReply(`❌ Server is unreachable (Offline).`);
+    if (interaction) interaction.editReply(`❌ Server is unreachable (Offline).`).catch(() => {});
     return;
   }
 
   const authDir = getUserAuthDir(uid);
-  const opts = { host: ip, port, connectTimeout: 47000, keepAlive: true };
+  const opts = {
+    host: ip,
+    port,
+    connectTimeout: 47000,
+    keepAlive: true
+  };
 
   if (u.connectionType === "offline") {
     opts.username = u.offlineUsername || `AFK_${uid.slice(-4)}`;
@@ -300,15 +342,27 @@ async function startSession(uid, interaction) {
     const afkInterval = setInterval(() => {
       try {
         const pos = { ...mc.entity.position };
-        moveToggle ? pos.x += 0.5 : pos.x -= 0.5;
+        // Liikutetaan bottia hieman eteen tai taakse
+        if (moveToggle) {
+           pos.x += 0.5;
+        } else {
+           pos.x -= 0.5;
+        }
         moveToggle = !moveToggle;
 
         mc.write("move_player", {
-          runtime_id: mc.entityId, position: pos, pitch: 0, yaw: Math.random() * 360,
-          head_yaw: Math.random() * 360, mode: 0, on_ground: true, ridden_runtime_id: 0, teleport: false
+          runtime_id: mc.entityId,
+          position: pos,
+          pitch: 0,
+          yaw: Math.random() * 360,
+          head_yaw: Math.random() * 360,
+          mode: 0,
+          on_ground: true,
+          ridden_runtime_id: 0,
+          teleport: false
         });
       } catch {}
-    }, 60 * 1000);
+    }, 60 * 1000); // Liikkuu minuutin välein
 
     mc.once("close", () => clearInterval(afkInterval));
     mc.once("error", () => clearInterval(afkInterval));
@@ -316,7 +370,7 @@ async function startSession(uid, interaction) {
 
   currentSession.timeout = setTimeout(() => {
     if (sessions.has(uid) && !currentSession.connected) {
-      if (interaction) interaction.editReply("❌ **Connection Timed Out**. Retrying in 30s...").catch(() => {});
+      if (interaction && !interaction.replied) interaction.editReply("❌ **Connection Timed Out**. Retrying in 30s...");
       mc.close();
     }
   }, 47000);
@@ -341,20 +395,28 @@ async function startSession(uid, interaction) {
     if (errorMsg.toLowerCase().includes("timeout") && interaction) {
         interaction.editReply("⚠️ **Ping Timed Out!** Connection lost, retrying in 30s...").catch(() => {});
     }
-    if (!currentSession.manualStop) handleAutoReconnect(uid, interaction);
+    if (!currentSession.manualStop) {
+        console.log(`[${uid}] Virhe, yritetään uudelleen 30s päästä: ${errorMsg}`);
+        handleAutoReconnect(uid, interaction);
+    }
   });
 
   mc.on("close", () => {
     clearTimeout(currentSession.timeout);
-    if (!currentSession.manualStop) handleAutoReconnect(uid, interaction);
+    if (!currentSession.manualStop) {
+        console.log(`[${uid}] Yhteys katkesi, yritetään uudelleen 30s päästä.`);
+        handleAutoReconnect(uid, interaction);
+    }
   });
 }
 
 function handleAutoReconnect(uid, interaction) {
     const s = sessions.get(uid);
     if (!s || s.manualStop || s.reconnectTimer) return;
+
     s.isReconnecting = true;
     s.connected = false;
+    
     s.reconnectTimer = setTimeout(() => {
         if (sessions.has(uid) && !s.manualStop) {
             s.reconnectTimer = null;
@@ -370,9 +432,9 @@ client.on(Events.InteractionCreate, async (i) => {
     if (blocked) return;
     const uid = i.user.id;
 
-    // --- Admin Slash Komento ---
+    // --- Admin Komento ---
     if (i.isChatInputCommand() && i.commandName === "admin") {
-        if (!ADMIN_IDS.includes(uid)) return i.reply({ content: "Access denied. ⛔", ephemeral: true });
+        if (!ADMIN_IDS.includes(uid)) return i.reply({ content: "Pääsy evätty. ⛔", ephemeral: true });
         
         await i.deferReply({ ephemeral: false });
         await i.editReply({ embeds: [buildAdminEmbed()], components: buildAdminComponents() });
@@ -385,7 +447,7 @@ client.on(Events.InteractionCreate, async (i) => {
         return;
     }
 
-    // --- Admin Napit ja Valikot ---
+    // --- Admin Napit & Valikot ---
     if (i.customId?.startsWith("admin_")) {
         if (!ADMIN_IDS.includes(uid)) return i.reply({ content: "Restricted access. ⛔", ephemeral: true });
         
@@ -394,49 +456,46 @@ client.on(Events.InteractionCreate, async (i) => {
         }
         if (i.customId === "admin_stop_all") {
             const uids = Array.from(sessions.keys());
-            for (const id of uids) await stopAndNotifyAdminAction(id);
+            for (const id of uids) {
+                stopSession(id);
+                try {
+                    const user = await client.users.fetch(id);
+                    if (user) await user.send("Your bot has been stopped by the owner ⚠️").catch(() => {});
+                } catch {}
+            }
             return i.update({ embeds: [buildAdminEmbed()], components: buildAdminComponents() });
         }
         if (i.customId === "admin_stop_user") {
             const target = i.values[0];
-            await stopAndNotifyAdminAction(target);
+            stopSession(target);
+            try {
+                const user = await client.users.fetch(target);
+                if (user) await user.send("Your bot has been stopped by the owner ⚠️").catch(() => {});
+            } catch {}
             return i.update({ embeds: [buildAdminEmbed()], components: buildAdminComponents() });
         }
     }
 
-    // --- Käyttäjän Slash Komennot ---
+    // --- Paneeli ---
     if (i.isChatInputCommand() && i.commandName === "panel") {
       return i.reply({ content: "🎛 **Bedrock AFK Panel**", components: panelRow() });
     }
 
-    // --- Käyttäjän Napit ---
+    // --- Painikkeet ---
     if (i.isButton()) {
       if (i.customId === "link") {
         await i.deferReply({ ephemeral: true });
-        let msg = "⏳ Requesting Microsoft login…";
-        const comps = [];
-        if (shouldShowPatreon()) { msg += "\n\nHelp us keep AFKBot up by donating through Patreon!"; comps.push(patreonRow()); }
-        await i.editReply({ content: msg, components: comps });
-        
-        const authDir = getUserAuthDir(uid);
-        const u = getUser(uid);
-        const flow = new Authflow(uid, authDir, { flow: "live", authTitle: "AFK Bot", deviceType: "Nintendo" }, async (data) => {
-            const uri = data.verification_uri_complete || data.verification_uri;
-            let m = `🔐 **Microsoft login required**\n\nCode: \`${data.user_code}\`\n\n👉 ${uri}`;
-            const c = [new ActionRowBuilder().addComponents(new ButtonBuilder().setLabel("🌐 Open link").setStyle(ButtonStyle.Link).setURL(uri))];
-            if (shouldShowPatreon()) { m += "\n\nHelp us keep AFKBot up by donating through Patreon!"; c.push(patreonRow()); }
-            await i.editReply({ content: m, components: c }).catch(() => {});
-        });
-        await flow.getMsaToken();
-        u.linked = true; save();
-        return i.followUp({ ephemeral: true, content: "✅ Linked!" });
+        return linkMicrosoft(uid, i);
       }
 
       if (i.customId === "unlink") {
         unlinkMicrosoft(uid);
-        let msg = "🗑 Microsoft account unlinked.";
+        let msg = "🗑 Microsoft account unlinked for your user.";
         const comps = [];
-        if (shouldShowPatreon()) { msg += "\n\nHelp us keep AFKBot up by donating through Patreon!"; comps.push(patreonRow()); }
+        if (shouldShowPatreon()) {
+          msg += "\n\nHelp us keep AFKBot up by donating through Patreon!";
+          comps.push(patreonRow());
+        }
         return i.reply({ ephemeral: true, content: msg, components: comps });
       }
 
@@ -445,7 +504,7 @@ client.on(Events.InteractionCreate, async (i) => {
         const modal = new ModalBuilder().setCustomId("settings_modal").setTitle("⚙ Bedrock Settings");
         modal.addComponents(
           new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("ip").setLabel("Server IP").setStyle(TextInputStyle.Short).setRequired(true).setValue(u.server?.ip || "")),
-          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("port").setLabel("Port").setStyle(TextInputStyle.Short).setRequired(true).setValue(String(u.server?.port || 19132))),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("port").setLabel("Port (19132)").setStyle(TextInputStyle.Short).setRequired(true).setValue(String(u.server?.port || 19132))),
           new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("offline").setLabel("Offline username").setStyle(TextInputStyle.Short).setRequired(false).setValue(u.offlineUsername || ""))
         );
         return i.showModal(modal);
@@ -462,7 +521,10 @@ client.on(Events.InteractionCreate, async (i) => {
         if (!ok) return i.reply({ ephemeral: true, content: "No bots running." });
         let msg = "⏹ Stopped.";
         const comps = [];
-        if (shouldShowPatreon()) { msg += "\n\nHelp us keep AFKBot up by donating through Patreon!"; comps.push(patreonRow()); }
+        if (shouldShowPatreon()) {
+          msg += "\n\nHelp us keep AFKBot up by donating through Patreon!";
+          comps.push(patreonRow());
+        }
         return i.reply({ ephemeral: true, content: msg, components: comps });
       }
 
@@ -473,28 +535,36 @@ client.on(Events.InteractionCreate, async (i) => {
           new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId("invisible").setLabel("👻 Hide Bot").setStyle(ButtonStyle.Secondary)),
           versionRow(u.bedrockVersion), connRow(u.connectionType)
         ];
-        if (shouldShowPatreon()) { msg += "\n\nHelp us keep AFKBot up by donating through Patreon!"; comps.push(patreonRow()); }
+        if (shouldShowPatreon()) {
+          msg += "\n\nHelp us keep AFKBot up by donating through Patreon!";
+          comps.push(patreonRow());
+        }
         return i.reply({ ephemeral: true, content: msg, components: comps });
       }
 
       if (i.customId === "invisible") {
         const s = sessions.get(uid);
         if (!s) return i.reply({ ephemeral: true, content: "Bot is not running." });
-        try { s.client.write("command_request", { command: "/gamemode survival @s", internal: false, version: 2 }); return i.reply({ ephemeral: true, content: "Attempted to hide bot." });
+        try {
+          s.client.write("command_request", { command: "/gamemode survival @s", internal: false, version: 2 });
+          return i.reply({ ephemeral: true, content: "Attempted to hide bot." });
         } catch { return i.reply({ ephemeral: true, content: "Commands not allowed." }); }
       }
     }
 
-    // --- Alasvetovalikot ja Modalit ---
+    // --- Valikot & Modaalit ---
     if (i.isStringSelectMenu()) {
       const u = getUser(uid);
       if (i.customId === "set_version" || i.customId === "set_conn") {
         if (i.customId === "set_version") u.bedrockVersion = i.values[0];
         else u.connectionType = i.values[0];
         save();
-        let msg = `Settings updated.`;
+        let msg = `Setting updated.`;
         const comps = [];
-        if (shouldShowPatreon()) { msg += "\n\nHelp us keep AFKBot up by donating through Patreon!"; comps.push(patreonRow()); }
+        if (shouldShowPatreon()) {
+          msg += "\n\nHelp us keep AFKBot up by donating through Patreon!";
+          comps.push(patreonRow());
+        }
         return i.reply({ ephemeral: true, content: msg, components: comps });
       }
     }
@@ -507,7 +577,10 @@ client.on(Events.InteractionCreate, async (i) => {
       save();
       let msg = `Settings saved.`;
       const comps = [];
-      if (shouldShowPatreon()) { msg += "\n\nHelp us keep AFKBot up by donating through Patreon!"; comps.push(patreonRow()); }
+      if (shouldShowPatreon()) {
+        msg += "\n\nHelp us keep AFKBot up by donating through Patreon!";
+        comps.push(patreonRow());
+      }
       return i.reply({ ephemeral: true, content: msg, components: comps });
     }
 
