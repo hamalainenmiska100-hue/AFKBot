@@ -25,12 +25,12 @@ if (!DISCORD_TOKEN) {
 
 const ALLOWED_GUILD_ID = "1462335230345089254";
 
-// ----------------- Storage -----------------
-const DATA = path.join(__dirname, "data");
+// ----------------- Storage (Fly.io Volume & Persistence) -----------------
+const DATA = fs.existsSync("/data") ? "/data" : path.join(__dirname, "data");
 const AUTH_ROOT = path.join(DATA, "auth");
 const STORE = path.join(DATA, "users.json");
 
-if (!fs.existsSync(DATA)) fs.mkdirSync(DATA);
+if (!fs.existsSync(DATA)) fs.mkdirSync(DATA, { recursive: true });
 if (!fs.existsSync(AUTH_ROOT)) fs.mkdirSync(AUTH_ROOT, { recursive: true });
 
 let users = fs.existsSync(STORE) ? JSON.parse(fs.readFileSync(STORE, "utf8")) : {};
@@ -111,11 +111,11 @@ function patreonRow() {
     new ButtonBuilder()
       .setLabel("Donate 💸")
       .setStyle(ButtonStyle.Link)
-      .setURL("https://patreon.com/AFKBot396?utm_medium=unknown&utm_source=join_link&utm_campaign=creatorshare_creator&utm_content=copyLink") // Replace with actual link
+      .setURL("https://www.patreon.com/your_patreon_link")
   );
 }
 
-// Helper to decide if we should show Patreon (60-80% chance -> 0.7 used here)
+// 60-80% chance helper (using 0.7 for ~70%)
 function shouldShowPatreon() {
   return Math.random() < 0.7;
 }
@@ -159,12 +159,12 @@ client.once("ready", async () => {
 async function linkMicrosoft(uid, interaction) {
   if (pendingLink.has(uid)) {
     let msg = "⏳ Login already in progress. Use the last code.";
+    const comps = [];
     if (shouldShowPatreon()) {
       msg += "\n\nHelp us keep AFKBot up by donating through Patreon!";
-      await interaction.editReply({ content: msg, components: [patreonRow()] });
-    } else {
-      await interaction.editReply(msg);
+      comps.push(patreonRow());
     }
+    await interaction.editReply({ content: msg, components: comps });
     return;
   }
 
@@ -212,12 +212,12 @@ async function linkMicrosoft(uid, interaction) {
       save();
       
       let msg = "✅ Microsoft account linked!";
+      const comps = [];
       if (shouldShowPatreon()) {
         msg += "\n\nHelp us keep AFKBot up by donating through Patreon!";
-        await interaction.followUp({ ephemeral: true, content: msg, components: [patreonRow()] }).catch(() => {});
-      } else {
-        await interaction.followUp({ ephemeral: true, content: msg }).catch(() => {});
+        comps.push(patreonRow());
       }
+      await interaction.followUp({ ephemeral: true, content: msg, components: comps }).catch(() => {});
     } catch (e) {
       await interaction.editReply(`❌ Microsoft login failed:\n${String(e?.message || e)}`).catch(() => {});
     } finally {
@@ -246,13 +246,14 @@ function stopSession(uid) {
   return true;
 }
 
-function startSession(uid, interaction) {
+async function startSession(uid, interaction) {
   const u = getUser(uid);
   if (!u.server) {
     if (interaction && !interaction.replied) interaction.editReply("⚠ Set settings first.");
     return;
   }
   
+  // Jos sessio on jo käynnissä eikä se ole uudelleenkytkentävaiheessa, estetään tuplakäynnistys
   const existing = sessions.get(uid);
   if (existing && !existing.isReconnecting) {
     if (interaction && !interaction.replied) interaction.editReply("⚠ You already have a running bot.");
@@ -260,6 +261,21 @@ function startSession(uid, interaction) {
   }
 
   const { ip, port } = u.server;
+
+  // --- Aternos/Proxy Protection: Ping before connecting ---
+  try {
+    const pingData = await bedrock.ping({ host: ip, port: port });
+    const motd = (pingData.motd || "").toLowerCase();
+    // Jos MOTD sanoo "offline", "starting" tai vastaavaa, älä liity
+    if (motd.includes("offline") || motd.includes("starting") || motd.includes("queue")) {
+        if (interaction) interaction.editReply(`❌ Server is currently **Offline** or **Starting**. Bot will not join the proxy lobby.`).catch(() => {});
+        return;
+    }
+  } catch (e) {
+    if (interaction) interaction.editReply(`❌ Server is unreachable (Offline).`).catch(() => {});
+    return;
+  }
+
   const authDir = getUserAuthDir(uid);
 
   const opts = {
@@ -282,7 +298,7 @@ function startSession(uid, interaction) {
   
   let currentSession = sessions.get(uid);
   if (!currentSession) {
-    currentSession = { client: mc, timeout: null, startedAt: Date.now(), manualStop: false };
+    currentSession = { client: mc, timeout: null, startedAt: Date.now(), manualStop: false, connected: false };
     sessions.set(uid, currentSession);
   } else {
     currentSession.client = mc;
@@ -298,6 +314,7 @@ function startSession(uid, interaction) {
     const afkInterval = setInterval(() => {
       try {
         const pos = { ...mc.entity.position };
+        // Liikutetaan bottia hieman eteen tai taakse
         if (moveToggle) {
            pos.x += 0.5;
         } else {
@@ -317,7 +334,7 @@ function startSession(uid, interaction) {
           teleport: false
         });
       } catch {}
-    }, 60 * 1000);
+    }, 60 * 1000); // Liikkuu minuutin välein
 
     mc.once("close", () => clearInterval(afkInterval));
     mc.once("error", () => clearInterval(afkInterval));
@@ -325,7 +342,7 @@ function startSession(uid, interaction) {
 
   currentSession.timeout = setTimeout(() => {
     if (sessions.has(uid) && !currentSession.connected) {
-      if (interaction && !interaction.replied) interaction.editReply("❌ Connection error ⛔ (timeout). Retrying in 30s...");
+      if (interaction && !interaction.replied) interaction.editReply("❌ **Connection Timed Out**. Retrying in 30s...");
       mc.close();
     }
   }, 47000);
@@ -346,8 +363,16 @@ function startSession(uid, interaction) {
 
   mc.on("error", (e) => {
     clearTimeout(currentSession.timeout);
+    let errorMsg = e.message || String(e);
+    const isTimeout = errorMsg.toLowerCase().includes("timeout") || errorMsg.toLowerCase().includes("etimedout");
+    
+    if (isTimeout) {
+      console.log(`[${uid}] Connection error: Ping Timed Out.`);
+      if (interaction) interaction.editReply("⚠️ **Ping Timed Out!** Connection was lost, retrying in 30s...").catch(() => {});
+    }
+
     if (!currentSession.manualStop) {
-        console.log(`[${uid}] Error, retrying in 30s: ${e.message}`);
+        console.log(`[${uid}] Virhe, yritetään uudelleen 30s päästä: ${errorMsg}`);
         handleAutoReconnect(uid, interaction);
     }
   });
@@ -355,7 +380,7 @@ function startSession(uid, interaction) {
   mc.on("close", () => {
     clearTimeout(currentSession.timeout);
     if (!currentSession.manualStop) {
-        console.log(`[${uid}] Connection closed, retrying in 30s.`);
+        console.log(`[${uid}] Yhteys katkesi, yritetään uudelleen 30s päästä.`);
         handleAutoReconnect(uid, interaction);
     }
   });
@@ -396,7 +421,13 @@ client.on(Events.InteractionCreate, async (i) => {
     if (i.isButton()) {
       if (i.customId === "link") {
         await i.deferReply({ ephemeral: true });
-        await i.editReply("⏳ Requesting Microsoft login…");
+        let msg = "⏳ Requesting Microsoft login…";
+        const comps = [];
+        if (shouldShowPatreon()) {
+          msg += "\n\nHelp us keep AFKBot up by donating through Patreon!";
+          comps.push(patreonRow());
+        }
+        await i.editReply({ content: msg, components: comps });
         return linkMicrosoft(uid, i);
       }
 
@@ -453,7 +484,7 @@ client.on(Events.InteractionCreate, async (i) => {
 
       if (i.customId === "start") {
         await i.deferReply({ ephemeral: true });
-        await i.editReply("⏳ Connecting…");
+        await i.editReply("⏳ Connecting (Checking server status)…");
         return startSession(uid, i);
       }
 
@@ -480,12 +511,10 @@ client.on(Events.InteractionCreate, async (i) => {
           versionRow(u.bedrockVersion),
           connRow(u.connectionType)
         ];
-        
         if (shouldShowPatreon()) {
           msg += "\n\nHelp us keep AFKBot up by donating through Patreon!";
           comps.push(patreonRow());
         }
-
         return i.reply({ ephemeral: true, content: msg, components: comps });
       }
 
@@ -551,7 +580,6 @@ client.on(Events.InteractionCreate, async (i) => {
         msg += "\n\nHelp us keep AFKBot up by donating through Patreon!";
         comps.push(patreonRow());
       }
-
       return i.reply({ ephemeral: true, content: msg, components: comps });
     }
 
