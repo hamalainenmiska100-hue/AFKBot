@@ -8,7 +8,7 @@ const {
 
 // --- ADMIN ASETUKSET ---
 // Lisää oma Discord User ID:si tähän listaan (esim. ["123456789012345678"])
-const ADMIN_IDS = ["YOUR_DISCORD_ID_HERE"];
+const ADMIN_IDS = ["1144987924123881564"];
 
 /**
  * Luo hallintapaneelin Embed-viestin, joka sisältää tilastot ja listan aktiivisista boteista.
