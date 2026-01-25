@@ -24,8 +24,11 @@ if (!DISCORD_TOKEN) {
   process.exit(1);
 }
 
+// --- GEMINI CONFIGURATION ---
+const GEMINI_API_KEY = "AIzaSyAZbj5F2X-FLM6NSqz_3K1sciQMepX6JMA";
+const GEMINI_MODEL = "gemini-2.5-flash-lite";
+
 // --- ADMIN CONFIGURATION ---
-// VAIHDA TÄHÄN OMA DISCORD ID:SI
 const ADMIN_IDS = ["1144987924123881564"];
 const ALLOWED_GUILD_ID = "1462335230345089254";
 
@@ -78,6 +81,40 @@ const client = new Client({
     GatewayIntentBits.GuildMembers
   ]
 });
+
+// ----------------- Gemini AI Error Explanation -----------------
+async function explainErrorWithGemini(error, context) {
+  const systemInstruction = `You are a technical support assistant for a Minecraft Bedrock AFK bot. 
+  The bot connects to servers using Microsoft or Offline accounts and moves the player to prevent kicks.
+  Explain the provided error in simple English. 
+  Explain how the bot works in relation to this error.
+  Tell the user EXACTLY what they can do to fix it (e.g., check server IP, restart Aternos, re-link Microsoft).
+  Be concise and professional. Do not say anything other than the explanation and instructions.`;
+
+  const userQuery = `Error: ${error}\nContext: ${context}`;
+
+  let delay = 1000;
+  for (let i = 0; i < 5; i++) {
+    try {
+      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: userQuery }] }],
+          systemInstruction: { parts: [{ text: systemInstruction }] }
+        })
+      });
+
+      if (!response.ok) throw new Error("API call failed");
+      const result = await response.json();
+      return result.candidates?.[0]?.content?.parts?.[0]?.text || "An unexpected error occurred. Please check your settings.";
+    } catch (e) {
+      if (i === 4) return `Technical Error: ${error}. Please check your server status or Microsoft link.`;
+      await new Promise(r => setTimeout(r, delay));
+      delay *= 2;
+    }
+  }
+}
 
 function denyIfWrongGuild(i) {
   if (!i.inGuild() || i.guildId !== ALLOWED_GUILD_ID) {
@@ -264,7 +301,8 @@ async function linkMicrosoft(uid, interaction) {
       save();
       await interaction.followUp({ ephemeral: true, content: "✅ Microsoft account linked!" }).catch(() => {});
     } catch (e) {
-      await interaction.editReply(`❌ Microsoft login failed:\n${String(e?.message || e)}`).catch(() => {});
+      const explanation = await explainErrorWithGemini(e.message, "Microsoft Account Linking Process");
+      await interaction.editReply({ content: `❌ **Microsoft Link Failed**\n\n${explanation}` }).catch(() => {});
     } finally {
       pendingLink.delete(uid);
     }
@@ -279,6 +317,7 @@ function cleanupSession(uid) {
   if (!s) return;
   if (s.timeout) clearTimeout(s.timeout);
   if (s.reconnectTimer) clearTimeout(s.reconnectTimer);
+  if (s.afkInterval) clearInterval(s.afkInterval);
   try { s.client.close(); } catch {}
   sessions.delete(uid);
 }
@@ -298,11 +337,9 @@ async function startSession(uid, interaction) {
     return;
   }
   
-  // Jos sessio on jo käynnissä eikä se ole uudelleenkytkentävaiheessa, estetään tuplakäynnistys
   const existing = sessions.get(uid);
   if (existing && !existing.isReconnecting) {
     if (interaction && !interaction.replied) {
-        // Professional error message for already running bot
         const msg = "⚠️ **Active Session Detected**\nYour AFK bot is already operational. To restart or change settings, please terminate the current session by tapping the **Stop** button first.";
         interaction.editReply(msg);
     }
@@ -311,16 +348,16 @@ async function startSession(uid, interaction) {
 
   const { ip, port } = u.server;
 
-  // --- Aternos/Proxy Protection ---
   try {
     const pingData = await bedrock.ping({ host: ip, port: port });
     const motd = (pingData.motd || "").toLowerCase();
     if (motd.includes("offline") || motd.includes("starting") || motd.includes("queue")) {
-        if (interaction) interaction.editReply(`❌ Server is currently **Offline** or **Starting**. Bot will not join the proxy lobby.`).catch(() => {});
+        if (interaction) interaction.editReply(`❌ Server Status: **Offline/Starting**. Bot will not connect to a proxy lobby. Check server status on Aternos.`).catch(() => {});
         return;
     }
   } catch (e) {
-    if (interaction) interaction.editReply(`❌ Server is unreachable (Offline).`).catch(() => {});
+    const explanation = await explainErrorWithGemini(e.message, `Pinging server ${ip}:${port}`);
+    if (interaction) interaction.editReply(`❌ **Network Error**\n\n${explanation}`).catch(() => {});
     return;
   }
 
@@ -345,7 +382,7 @@ async function startSession(uid, interaction) {
   
   let currentSession = sessions.get(uid);
   if (!currentSession) {
-    currentSession = { client: mc, timeout: null, startedAt: Date.now(), manualStop: false, connected: false };
+    currentSession = { client: mc, timeout: null, startedAt: Date.now(), manualStop: false, connected: false, afkInterval: null };
     sessions.set(uid, currentSession);
   } else {
     currentSession.client = mc;
@@ -358,10 +395,9 @@ async function startSession(uid, interaction) {
     clearInterval(waitForEntity);
 
     let moveToggle = false;
-    const afkInterval = setInterval(() => {
+    currentSession.afkInterval = setInterval(() => {
       try {
         const pos = { ...mc.entity.position };
-        // Liikutetaan bottia hieman eteen tai taakse
         if (moveToggle) {
            pos.x += 0.5;
         } else {
@@ -381,15 +417,16 @@ async function startSession(uid, interaction) {
           teleport: false
         });
       } catch {}
-    }, 60 * 1000); // Liikkuu minuutin välein
+    }, 60 * 1000);
 
-    mc.once("close", () => clearInterval(afkInterval));
-    mc.once("error", () => clearInterval(afkInterval));
+    mc.once("close", () => { if(currentSession.afkInterval) clearInterval(currentSession.afkInterval); });
+    mc.once("error", () => { if(currentSession.afkInterval) clearInterval(currentSession.afkInterval); });
   }, 1000);
 
-  currentSession.timeout = setTimeout(() => {
+  currentSession.timeout = setTimeout(async () => {
     if (sessions.has(uid) && !currentSession.connected) {
-      if (interaction && !interaction.replied) interaction.editReply("❌ **Connection Timed Out**. Retrying in 30s...");
+      const explanation = await explainErrorWithGemini("Connection Timeout", `Establishing Bedrock connection to ${ip}:${port}`);
+      if (interaction && !interaction.replied) interaction.editReply(`❌ **Connection Failed**\n\n${explanation}`).catch(() => {});
       mc.close();
     }
   }, 47000);
@@ -398,7 +435,7 @@ async function startSession(uid, interaction) {
     currentSession.connected = true;
     clearTimeout(currentSession.timeout);
     if (interaction) {
-        let msg = `🟢 Connected to **${ip}:${port}** (Auto-move active)`;
+        let msg = `🟢 Connected successfully to **${ip}:${port}** (Auto-move protocol: ACTIVE)`;
         const comps = [];
         if (shouldShowPatreon()) {
           msg += "\n\nHelp us keep AFKBot up by donating through Patreon!";
@@ -408,18 +445,13 @@ async function startSession(uid, interaction) {
     }
   });
 
-  mc.on("error", (e) => {
+  mc.on("error", async (e) => {
     clearTimeout(currentSession.timeout);
     let errorMsg = e.message || String(e);
-    const isTimeout = errorMsg.toLowerCase().includes("timeout") || errorMsg.toLowerCase().includes("etimedout");
     
-    if (isTimeout) {
-      console.log(`[${uid}] Connection error: Ping Timed Out.`);
-      if (interaction) interaction.editReply("⚠️ **Ping Timed Out!** Connection was lost, retrying in 30s...").catch(() => {});
-    }
-
     if (!currentSession.manualStop) {
-        console.log(`[${uid}] Virhe, yritetään uudelleen 30s päästä: ${errorMsg}`);
+        const explanation = await explainErrorWithGemini(errorMsg, `Active Minecraft Session for ${ip}:${port}`);
+        if (interaction) interaction.editReply(`⚠️ **Session Error**\n\n${explanation}`).catch(() => {});
         handleAutoReconnect(uid, interaction);
     }
   });
@@ -427,7 +459,6 @@ async function startSession(uid, interaction) {
   mc.on("close", () => {
     clearTimeout(currentSession.timeout);
     if (!currentSession.manualStop) {
-        console.log(`[${uid}] Yhteys katkesi, yritetään uudelleen 30s päästä.`);
         handleAutoReconnect(uid, interaction);
     }
   });
@@ -455,13 +486,10 @@ client.on(Events.InteractionCreate, async (i) => {
     if (blocked) return;
     const uid = i.user.id;
 
-    // --- Admin Slash-komento ---
     if (i.isChatInputCommand() && i.commandName === "admin") {
-        if (!ADMIN_IDS.includes(uid)) return i.reply({ content: "Pääsy evätty. Et ole järjestelmänvalvoja. ⛔", ephemeral: true });
-        
+        if (!ADMIN_IDS.includes(uid)) return i.reply({ content: "Access denied. Järjestelmänvalvojan oikeudet vaaditaan. ⛔", ephemeral: true });
         await i.deferReply({ ephemeral: false });
         await i.editReply({ embeds: [buildAdminEmbed()], components: buildAdminComponents() });
-
         const interval = setInterval(async () => {
             try {
                 await i.editReply({ embeds: [buildAdminEmbed()], components: buildAdminComponents() });
@@ -470,10 +498,8 @@ client.on(Events.InteractionCreate, async (i) => {
         return;
     }
 
-    // --- Admin-napit ja alasvetovalikko ---
     if (i.customId?.startsWith("admin_")) {
-        if (!ADMIN_IDS.includes(uid)) return i.reply({ content: "Pääsy evätty. ⛔", ephemeral: true });
-        
+        if (!ADMIN_IDS.includes(uid)) return i.reply({ content: "Access denied. ⛔", ephemeral: true });
         if (i.customId === "admin_refresh") {
             return i.update({ embeds: [buildAdminEmbed()], components: buildAdminComponents() });
         }
@@ -489,18 +515,15 @@ client.on(Events.InteractionCreate, async (i) => {
         }
     }
 
-    // --- Käyttäjän paneeli ---
     if (i.isChatInputCommand() && i.commandName === "panel") {
       return i.reply({ content: "🎛 **Bedrock AFK Panel**", components: panelRow() });
     }
 
-    // --- Painikkeet ---
     if (i.isButton()) {
       if (i.customId === "link") {
         await i.deferReply({ ephemeral: true });
         return linkMicrosoft(uid, i);
       }
-
       if (i.customId === "unlink") {
         unlinkMicrosoft(uid);
         let msg = "🗑 Microsoft account unlinked for your user.";
@@ -511,7 +534,6 @@ client.on(Events.InteractionCreate, async (i) => {
         }
         return i.reply({ ephemeral: true, content: msg, components: comps });
       }
-
       if (i.customId === "settings") {
         const u = getUser(uid);
         const modal = new ModalBuilder().setCustomId("settings_modal").setTitle("⚙ Bedrock Settings");
@@ -522,17 +544,15 @@ client.on(Events.InteractionCreate, async (i) => {
         );
         return i.showModal(modal);
       }
-
       if (i.customId === "start") {
         await i.deferReply({ ephemeral: true });
-        await i.editReply("⏳ Connecting (Checking server status)…");
+        await i.editReply("⏳ Connecting (Establishing secure connection)…");
         return startSession(uid, i);
       }
-
       if (i.customId === "stop") {
         const ok = stopSession(uid);
-        if (!ok) return i.reply({ ephemeral: true, content: "No bots running." });
-        let msg = "⏹ Stopped.";
+        if (!ok) return i.reply({ ephemeral: true, content: "No active sessions found for your ID." });
+        let msg = "⏹ **Session Terminated.** The bot has disconnected.";
         const comps = [];
         if (shouldShowPatreon()) {
           msg += "\n\nHelp us keep AFKBot up by donating through Patreon!";
@@ -540,10 +560,9 @@ client.on(Events.InteractionCreate, async (i) => {
         }
         return i.reply({ ephemeral: true, content: msg, components: comps });
       }
-
       if (i.customId === "more") {
         const u = getUser(uid);
-        let msg = "➕ **More options**";
+        let msg = "➕ **Extended Menu**";
         const comps = [
           new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId("invisible").setLabel("👻 Hide Bot").setStyle(ButtonStyle.Secondary)),
           versionRow(u.bedrockVersion), connRow(u.connectionType)
@@ -554,25 +573,23 @@ client.on(Events.InteractionCreate, async (i) => {
         }
         return i.reply({ ephemeral: true, content: msg, components: comps });
       }
-
       if (i.customId === "invisible") {
         const s = sessions.get(uid);
         if (!s) return i.reply({ ephemeral: true, content: "Bot is not running." });
         try {
           s.client.write("command_request", { command: "/gamemode survival @s", internal: false, version: 2 });
-          return i.reply({ ephemeral: true, content: "Attempted to hide bot." });
-        } catch { return i.reply({ ephemeral: true, content: "Commands not allowed." }); }
+          return i.reply({ ephemeral: true, content: "Ghost protocol initiated (Attempted)." });
+        } catch { return i.reply({ ephemeral: true, content: "Permission denied for command execution." }); }
       }
     }
 
-    // --- Alasvetovalikot ja Modalit ---
     if (i.isStringSelectMenu()) {
       const u = getUser(uid);
       if (i.customId === "set_version" || i.customId === "set_conn") {
         if (i.customId === "set_version") u.bedrockVersion = i.values[0];
         else u.connectionType = i.values[0];
         save();
-        let msg = `Setting updated.`;
+        let msg = `✅ Settings updated successfully.`;
         const comps = [];
         if (shouldShowPatreon()) {
           msg += "\n\nHelp us keep AFKBot up by donating through Patreon!";
@@ -588,7 +605,7 @@ client.on(Events.InteractionCreate, async (i) => {
       const off = i.fields.getTextInputValue("offline").trim();
       if (off) u.offlineUsername = off;
       save();
-      let msg = `Settings saved.`;
+      let msg = `📁 **Configuration Saved.**\nDestination: \`${u.server.ip}:${u.server.port}\``;
       const comps = [];
       if (shouldShowPatreon()) {
         msg += "\n\nHelp us keep AFKBot up by donating through Patreon!";
@@ -597,7 +614,7 @@ client.on(Events.InteractionCreate, async (i) => {
       return i.reply({ ephemeral: true, content: msg, components: comps });
     }
 
-  } catch (e) { console.error("Interaction error:", e); }
+  } catch (e) { console.error("Critical interaction error:", e); }
 });
 
 client.once("ready", async () => {
@@ -609,8 +626,8 @@ client.once("ready", async () => {
   await client.application.commands.set(cmds);
 });
 
-process.on("unhandledRejection", (e) => console.error("unhandledRejection:", e));
-process.on("uncaughtException", (e) => console.error("uncaughtException:", e));
+process.on("unhandledRejection", (e) => console.error("Unhandled Promise Rejection:", e));
+process.on("uncaughtException", (e) => console.error("Uncaught Exception:", e));
 
 client.login(DISCORD_TOKEN);
 
