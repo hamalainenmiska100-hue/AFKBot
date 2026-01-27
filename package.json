@@ -1,13 +1,18 @@
 {
-  "name": "bedrock-panel-bot",
-  "version": "1.0.0",
+  "name": "bedrock-java-afk-bot",
+  "version": "25.0.0",
+  "description": "Ultimate AFK bot for Bedrock and Java Edition with Physics and Persistence",
   "main": "bot.js",
+  "dependencies": {
+    "discord.js": "^14.14.1",
+    "bedrock-protocol": "^3.26.0",
+    "mineflayer": "^4.20.0",
+    "prismarine-auth": "^2.3.0",
+    "fs": "^0.0.1-security",
+    "path": "^0.12.7"
+  },
   "scripts": {
     "start": "node bot.js"
-  },
-  "dependencies": {
-    "bedrock-protocol": "^3.0.0",
-    "discord.js": "^14.14.1",
-    "prismarine-auth": "^2.4.0"
   }
 }
+
