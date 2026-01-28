@@ -1,7 +1,6 @@
 app = "afkbot"
 primary_region = "ams"
 [processes]
-Ajetaan molemmat prosessit rinnakkain
 api = "node api.js"
 bot = "node bot.js"
 [http_service]
