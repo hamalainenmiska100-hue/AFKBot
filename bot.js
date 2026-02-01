@@ -36,9 +36,6 @@ if (!fs.existsSync(AUTH_ROOT)) fs.mkdirSync(AUTH_ROOT, { recursive: true });
 
 let users = fs.existsSync(STORE) ? JSON.parse(fs.readFileSync(STORE, "utf8")) : {};
 
-/**
- * Saves user data to the JSON store asynchronously.
- */
 async function save() {
   try {
     await fs.promises.writeFile(STORE, JSON.stringify(users, null, 2));
@@ -47,9 +44,6 @@ async function save() {
   }
 }
 
-/**
- * Retrieves or initializes user configuration.
- */
 function getUser(uid) {
   if (!users[uid]) users[uid] = {};
   if (!users[uid].connectionType) users[uid].connectionType = "online";
@@ -79,16 +73,11 @@ const pendingLink = new Map();
 // ----------------- Discord Client Setup -----------------
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
-/**
- * Safely replies to an interaction, handling expired or deferred states.
- */
 async function safeReply(interaction, options) {
   try {
     if (interaction.replied || interaction.deferred) return await interaction.editReply(options);
     return await interaction.reply(options);
-  } catch (e) {
-    // Interaction likely expired or was deleted
-  }
+  } catch (e) {}
 }
 
 // ----------------- Global System Monitor (30s) -----------------
@@ -100,7 +89,7 @@ setInterval(() => {
   
   sessions.forEach((s, uid) => {
     const status = s.connected ? "CONNECTED" : (s.isReconnecting ? "RECONNECTING" : "INITIALIZING");
-    console.log(` > User [${uid}]: ${status} | Uptime: ${Math.floor((Date.now() - s.startedAt)/1000)}s`);
+    console.log(` > User [${uid}]: ${status} | Since: ${new Date(s.startedAt).toLocaleTimeString()}`);
   });
   console.log(`----------------------------------------------------\n`);
 }, 30000);
@@ -173,7 +162,7 @@ async function linkMicrosoft(uid, interaction) {
     const uri = data.verification_uri_complete || data.verification_uri || "https://www.microsoft.com/link";
     const code = data.user_code || "ERROR";
     
-    const content = `🔐 **Microsoft Account Linking**\n\n1. Visit: [Microsoft Link](${uri})\n2. Enter code: \`${code}\`\n\n*This message will update once you have authenticated.*`;
+    const content = `🔐 **Microsoft Account Linking**\n\n1. Visit: [Microsoft Link](${uri})\n2. Enter code: \`${code}\`\n\n*Follow the steps and return here.*`;
     await safeReply(interaction, { 
         content: content, 
         components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setLabel("🌐 Open Login Page").setStyle(ButtonStyle.Link).setURL(uri))] 
@@ -197,21 +186,28 @@ async function linkMicrosoft(uid, interaction) {
 
 function startSession(uid, interaction) {
   const u = getUser(uid);
-  if (!u.server) return safeReply(interaction, "⚠ Please configure your server settings first.");
-
-  // Check if a session is already running for this user
+  if (!u.server) {
+    if (interaction && !interaction.replied) safeReply(interaction, "⚠ Set settings first.");
+    return;
+  }
+  
+  // Check if session is already running and not in reconnection phase
   const existing = sessions.get(uid);
   if (existing && !existing.isReconnecting) {
-    return safeReply(interaction, "❌ **Bot already running for your account!** Please stop the existing bot before starting a new one.");
+    if (interaction && !interaction.replied) safeReply(interaction, "❌ **Bot already running for your account!** Stop the current bot before starting a new one.");
+    return;
   }
 
   const { ip, port } = u.server;
   const authDir = getUserAuthDir(uid);
 
+  // Immediate UI feedback
+  if (interaction) safeReply(interaction, `⏳ **Connecting to ${ip}:${port}...**`);
+
   const opts = {
     host: ip,
     port,
-    connectTimeout: 45000,
+    connectTimeout: 47000,
     keepAlive: true,
     version: u.bedrockVersion === "auto" ? undefined : u.bedrockVersion
   };
@@ -221,110 +217,119 @@ function startSession(uid, interaction) {
     opts.offline = true;
   } else {
     opts.username = uid;
+    opts.offline = false;
     opts.profilesFolder = authDir;
   }
 
   const mc = bedrock.createClient(opts);
   
-  const sessionData = {
-    client: mc,
-    startedAt: Date.now(),
-    manualStop: false,
-    connected: false,
-    isReconnecting: false,
-    pos: { x: 0, y: 0, z: 0 },
-    afkInterval: null,
-    waitForEntity: null,
-    timeout: null,
-    reconnectTimer: null
-  };
-  sessions.set(uid, sessionData);
+  let currentSession = sessions.get(uid);
+  if (!currentSession) {
+    currentSession = { 
+      client: mc, 
+      timeout: null, 
+      startedAt: Date.now(), 
+      manualStop: false, 
+      connected: false, 
+      isReconnecting: false,
+      pos: { x: 0, y: 0, z: 0 },
+      afkInterval: null,
+      waitForEntity: null
+    };
+    sessions.set(uid, currentSession);
+  } else {
+    currentSession.client = mc;
+    currentSession.isReconnecting = false;
+  }
 
-  // --- AUTHORITY SYNC ENGINE ---
-  // Listens to server-forced movements (e.g., gravity, knockback, arrows)
+  // Authority & Position Sync
   mc.on('move_player', (packet) => {
     if (packet.runtime_id === mc.entityId) {
-      sessionData.pos = packet.position; 
+      currentSession.pos = packet.position; 
     }
   });
 
-  mc.on('start_game', (packet) => {
-    sessionData.pos = packet.player_position;
-  });
+  currentSession.waitForEntity = setInterval(() => {
+    if (!mc.entity || !mc.entityId) return;
+    clearInterval(currentSession.waitForEntity);
+    currentSession.waitForEntity = null;
 
-  mc.on('spawn', () => {
-    sessionData.connected = true;
-    clearTimeout(sessionData.timeout);
-    safeReply(interaction, `🟢 Bot connected to **${ip}:${port}**\nPhysics synchronization and Anti-AFK are now active.`);
+    let moveToggle = false;
+    currentSession.afkInterval = setInterval(() => {
+      try {
+        const yaw = Math.random() * 360;
+        const pitch = (Math.random() * 10) - 5;
+        const offset = moveToggle ? 0.05 : -0.05;
+        moveToggle = !moveToggle;
 
-    // Initialize AFK logic once the player entity is ready
-    sessionData.waitForEntity = setInterval(() => {
-      if (!mc.entityId) return;
-      clearInterval(sessionData.waitForEntity);
-      sessionData.waitForEntity = null;
-      
-      sessionData.afkInterval = setInterval(() => {
-        try {
-          if (!mc.entityId) return;
+        currentSession.pos.x += offset;
+        currentSession.pos.z += offset;
 
-          const yaw = Math.random() * 360;
-          const pitch = (Math.random() * 10) - 5;
-          const offset = (Math.random() - 0.5) * 0.1;
-          
-          sessionData.pos.x += offset;
-          sessionData.pos.z += offset;
+        // Sync with both Move and Auth Input packets
+        mc.write("move_player", {
+          runtime_id: mc.entityId,
+          position: currentSession.pos,
+          pitch, yaw, head_yaw: yaw,
+          mode: 0, on_ground: true, ridden_runtime_id: 0, teleport: false
+        });
 
-          // 1. Move Player Packet (Client-side request)
-          mc.write("move_player", {
-            runtime_id: mc.entityId,
-            position: sessionData.pos,
-            pitch, yaw, head_yaw: yaw,
-            mode: 0, on_ground: true, ridden_runtime_id: 0, teleport: false
-          });
+        mc.write("player_auth_input", {
+          pitch, yaw, head_yaw: yaw,
+          position: currentSession.pos,
+          move_vector: { x: offset, z: offset },
+          input_data: { _value: 0n, is_sneaking: false, is_sprinting: false },
+          input_mode: 'mouse', play_mode: 'normal', tick: 0n, delta: { x: offset, y: 0, z: offset }
+        });
+      } catch (e) {}
+    }, 30000);
+  }, 1000);
 
-          // 2. Player Auth Input (Server-side validation)
-          mc.write("player_auth_input", {
-            pitch, yaw, head_yaw: yaw,
-            position: sessionData.pos,
-            move_vector: { x: offset, z: offset },
-            input_data: { _value: 0n, is_sneaking: false, is_sprinting: false },
-            input_mode: 'mouse', play_mode: 'normal', tick: 0n, delta: { x: offset, y: 0, z: offset }
-          });
-        } catch (e) {}
-      }, 30000); // 30s cycle for high reliability
-    }, 1000);
-  });
-
-  sessionData.timeout = setTimeout(() => {
-    if (!sessionData.connected) {
+  currentSession.timeout = setTimeout(() => {
+    if (sessions.has(uid) && !currentSession.connected) {
+      if (interaction) safeReply(interaction, `❌ **Connection Timeout** at ${ip}:${port}. Retrying in 30s...`);
       mc.close();
-      handleReconnect(uid, interaction);
     }
   }, 47000);
 
-  mc.on("error", (err) => {
-    console.error(`[Session ${uid}] Error:`, err.message);
-    handleReconnect(uid, interaction);
+  mc.on("spawn", () => {
+    currentSession.connected = true;
+    clearTimeout(currentSession.timeout);
+    if (interaction) {
+        safeReply(interaction, `🟢 **Connected to ${ip}:${port}**\nAnti-AFK and Physics Sync are active.`);
+    }
   });
-  
-  mc.on("close", () => handleReconnect(uid, interaction));
+
+  mc.on("error", (e) => {
+    clearTimeout(currentSession.timeout);
+    if (!currentSession.manualStop) {
+        handleAutoReconnect(uid, interaction);
+    }
+  });
+
+  mc.on("close", () => {
+    clearTimeout(currentSession.timeout);
+    if (!currentSession.manualStop) {
+        handleAutoReconnect(uid, interaction);
+    }
+  });
 }
 
-function handleReconnect(uid, interaction) {
-  const s = sessions.get(uid);
-  if (!s || s.manualStop || s.reconnectTimer) return;
+function handleAutoReconnect(uid, interaction) {
+    const s = sessions.get(uid);
+    if (!s || s.manualStop || s.reconnectTimer) return;
 
-  s.isReconnecting = true;
-  s.connected = false;
-  if (s.afkInterval) clearInterval(s.afkInterval);
-  if (s.waitForEntity) clearInterval(s.waitForEntity);
+    s.isReconnecting = true;
+    s.connected = false;
+    
+    if (s.afkInterval) clearInterval(s.afkInterval);
+    if (s.waitForEntity) clearInterval(s.waitForEntity);
 
-  s.reconnectTimer = setTimeout(() => {
-    if (sessions.has(uid) && !s.manualStop) {
-      s.reconnectTimer = null;
-      startSession(uid, interaction);
-    }
-  }, 30000); // Strict 30-second delay
+    s.reconnectTimer = setTimeout(() => {
+        if (sessions.has(uid) && !s.manualStop) {
+            s.reconnectTimer = null;
+            startSession(uid, interaction);
+        }
+    }, 30000);
 }
 
 // ----------------- Interaction Listeners -----------------
@@ -340,25 +345,27 @@ client.on(Events.InteractionCreate, async (i) => {
     if (i.isButton()) {
       if (i.customId === "link") { await i.deferReply({ ephemeral: true }); return linkMicrosoft(uid, i); }
       if (i.customId === "unlink") { unlinkMicrosoft(uid); return i.reply({ ephemeral: true, content: "🗑 Microsoft account unlinked." }); }
-      if (i.customId === "start") { await i.deferReply({ ephemeral: true }); return startSession(uid, i); }
+      if (i.customId === "start") { 
+          await i.deferReply({ ephemeral: true }); 
+          return startSession(uid, i); 
+      }
       if (i.customId === "stop") { 
           const s = sessions.get(uid);
-          if (s) { s.manualStop = true; cleanupSession(uid); return i.reply({ ephemeral: true, content: "⏹ Bot stopped and session cleared." }); }
+          if (s) { 
+              s.manualStop = true; 
+              cleanupSession(uid); 
+              return i.reply({ ephemeral: true, content: "⏹ Bot stopped manually." }); 
+          }
           return i.reply({ ephemeral: true, content: "No active bot found for your account." });
       }
       if (i.customId === "settings") {
         const u = getUser(uid);
         const modal = new ModalBuilder().setCustomId("settings_modal").setTitle("⚙ Server Configuration");
+        const ip = new TextInputBuilder().setCustomId("ip").setLabel("Server Address").setStyle(TextInputStyle.Short).setRequired(true).setValue(u.server?.ip || "");
+        const port = new TextInputBuilder().setCustomId("port").setLabel("Port").setStyle(TextInputStyle.Short).setRequired(true).setValue(String(u.server?.port || 19132));
+        const off = new TextInputBuilder().setCustomId("off").setLabel("Offline Username").setStyle(TextInputStyle.Short).setRequired(false).setValue(u.offlineUsername || "");
         
-        const ip = new TextInputBuilder().setCustomId("ip").setLabel("Server Address (IP/Host)").setStyle(TextInputStyle.Short).setRequired(true).setValue(u.server?.ip || "");
-        const port = new TextInputBuilder().setCustomId("port").setLabel("Server Port (Default 19132)").setStyle(TextInputStyle.Short).setRequired(true).setValue(String(u.server?.port || 19132));
-        const off = new TextInputBuilder().setCustomId("off").setLabel("Offline Username (Cracked)").setStyle(TextInputStyle.Short).setRequired(false).setValue(u.offlineUsername || "");
-        
-        modal.addComponents(
-            new ActionRowBuilder().addComponents(ip), 
-            new ActionRowBuilder().addComponents(port), 
-            new ActionRowBuilder().addComponents(off)
-        );
+        modal.addComponents(new ActionRowBuilder().addComponents(ip), new ActionRowBuilder().addComponents(port), new ActionRowBuilder().addComponents(off));
         return i.showModal(modal);
       }
       if (i.customId === "more") {
@@ -369,8 +376,8 @@ client.on(Events.InteractionCreate, async (i) => {
 
     if (i.isStringSelectMenu()) {
       const u = getUser(uid);
-      if (i.customId === "set_version") { u.bedrockVersion = i.values[0]; save(); return i.reply({ ephemeral: true, content: `✅ Protocol version set to: **${u.bedrockVersion}**` }); }
-      if (i.customId === "set_conn") { u.connectionType = i.values[0]; save(); return i.reply({ ephemeral: true, content: `✅ Connection mode updated to: **${u.connectionType}**` }); }
+      if (i.customId === "set_version") { u.bedrockVersion = i.values[0]; save(); return i.reply({ ephemeral: true, content: `✅ Version set to: **${u.bedrockVersion}**` }); }
+      if (i.customId === "set_conn") { u.connectionType = i.values[0]; save(); return i.reply({ ephemeral: true, content: `✅ Connection mode set to: **${u.connectionType}**` }); }
     }
 
     if (i.isModalSubmit() && i.customId === "settings_modal") {
@@ -384,25 +391,17 @@ client.on(Events.InteractionCreate, async (i) => {
       u.server = { ip, port };
       if (off) u.offlineUsername = off;
       save();
-      return i.reply({ ephemeral: true, content: `✅ Configuration saved for **${ip}:${port}**` });
+      return i.reply({ ephemeral: true, content: `✅ Configuration saved: **${ip}:${port}**` });
     }
-  } catch (e) { 
-    console.error("Interaction Error:", e); 
-  }
+  } catch (e) { console.error("Interaction Error:", e); }
 });
 
 client.once("ready", async () => {
   console.log(`🟢 System Online. Logged in as: ${client.user.tag}`);
-  // Register Slash Commands
-  await client.application.commands.set([
-    new SlashCommandBuilder()
-        .setName("panel")
-        .setDescription("Open the AFK Bot Management Panel")
-  ]);
+  await client.application.commands.set([new SlashCommandBuilder().setName("panel").setDescription("Open the AFK Bot Management Panel")]);
 });
 
-// Global Error Handling to prevent crashes
-process.on("unhandledRejection", (e) => console.error("Unhandled Promise Rejection:", e));
+process.on("unhandledRejection", (e) => console.error("Unhandled Rejection:", e));
 process.on("uncaughtException", (e) => console.error("Uncaught Exception:", e));
 
 client.login(DISCORD_TOKEN);
