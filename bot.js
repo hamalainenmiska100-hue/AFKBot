@@ -9,7 +9,8 @@ const {
   ModalBuilder,
   TextInputBuilder,
   TextInputStyle,
-  StringSelectMenuBuilder
+  StringSelectMenuBuilder,
+  EmbedBuilder
 } = require("discord.js");
 
 const bedrock = require("bedrock-protocol");
@@ -24,7 +25,9 @@ if (!DISCORD_TOKEN) {
   process.exit(1);
 }
 
+// ----------------- Configuration -----------------
 const ALLOWED_GUILD_ID = "1462335230345089254";
+const ADMIN_ID = "1144987924123881564"; // Sinun ID
 
 // ----------------- Storage Management -----------------
 const DATA = path.join(__dirname, "data");
@@ -69,9 +72,10 @@ function unlinkMicrosoft(uid) {
 // ----------------- Runtime State -----------------
 const sessions = new Map();
 const pendingLink = new Map();
+let adminDashboardMessage = null; // Store the message object to edit it later
 
 // ----------------- Discord Client Setup -----------------
-const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.DirectMessages] });
 
 async function safeReply(interaction, options) {
   try {
@@ -80,18 +84,79 @@ async function safeReply(interaction, options) {
   } catch (e) {}
 }
 
+// ----------------- Admin Dashboard Logic -----------------
+function getUptime() {
+  const uptime = process.uptime();
+  const hours = Math.floor(uptime / 3600);
+  const minutes = Math.floor((uptime % 3600) / 60);
+  const seconds = Math.floor(uptime % 60);
+  return `${hours}h ${minutes}m ${seconds}s`;
+}
+
+async function generateAdminView() {
+  const mem = (process.memoryUsage().heapUsed / 1024 / 1024).toFixed(2);
+  const totalSessions = sessions.size;
+  
+  const embed = new EmbedBuilder()
+    .setTitle("🛡️ System Admin Dashboard")
+    .setColor(0xFF0000)
+    .addFields(
+      { name: "Server Health", value: `💾 **RAM:** ${mem} MB\n⏱ **Uptime:** ${getUptime()}\n🤖 **Active Bots:** ${totalSessions}`, inline: true },
+      { name: "Last Updated", value: `<t:${Math.floor(Date.now() / 1000)}:R>`, inline: true }
+    )
+    .setTimestamp();
+
+  if (totalSessions === 0) {
+    embed.setDescription("*No active bots currently running.*");
+  } else {
+    let description = "";
+    sessions.forEach((s, uid) => {
+      const u = users[uid] || {};
+      const serverInfo = u.server ? `${u.server.ip}:${u.server.port}` : "Unknown";
+      const statusIcon = s.connected ? "🟢" : (s.isReconnecting ? "🟠" : "🔴");
+      const duration = Math.floor((Date.now() - s.startedAt) / 60000); // minutes
+      
+      // Try to get gamertag or username
+      const identity = s.gamertag || u.offlineUsername || "Unknown ID";
+      
+      description += `**${statusIcon} User:** <@${uid}> (${uid})\n`;
+      description += `> **Server:** \`${serverInfo}\`\n`;
+      description += `> **Identity:** \`${identity}\`\n`;
+      description += `> **Time Active:** ${duration} mins\n\n`;
+    });
+    // Discord message limit check
+    if (description.length > 4000) description = description.substring(0, 3900) + "... (truncated)";
+    embed.setDescription(description);
+  }
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId("admin_refresh").setLabel("🔄 Refresh Data").setStyle(ButtonStyle.Primary)
+  );
+
+  return { embeds: [embed], components: [row] };
+}
+
+async function updateAdminDashboard() {
+  if (!adminDashboardMessage) return;
+  try {
+    const data = await generateAdminView();
+    await adminDashboardMessage.edit(data);
+  } catch (e) {
+    console.log("Admin dashboard lost (message deleted?), stopping updates.");
+    adminDashboardMessage = null;
+  }
+}
+
 // ----------------- Global System Monitor (30s) -----------------
 setInterval(() => {
+  // Console logging
   const mem = process.memoryUsage().heapUsed / 1024 / 1024;
-  console.log(`\n--- [SYSTEM STATUS REPORT] ${new Date().toLocaleTimeString()} ---`);
-  console.log(`Active Sessions: ${sessions.size}`);
-  console.log(`Memory Usage: ${mem.toFixed(2)} MB`);
+  console.log(`[STATUS] Sessions: ${sessions.size} | Mem: ${mem.toFixed(2)} MB`);
   
-  sessions.forEach((s, uid) => {
-    const status = s.connected ? "CONNECTED" : (s.isReconnecting ? "RECONNECTING" : "INITIALIZING");
-    console.log(` > User [${uid}]: ${status} | Since: ${new Date(s.startedAt).toLocaleTimeString()}`);
-  });
-  console.log(`----------------------------------------------------\n`);
+  // Update Admin Panel if active
+  if (adminDashboardMessage) {
+    updateAdminDashboard();
+  }
 }, 30000);
 
 // ----------------- UI Component Generators -----------------
@@ -204,8 +269,8 @@ async function startSession(uid, interaction) {
   if (interaction) safeReply(interaction, `🔍 **Pinging server ${ip}:${port}...**`);
   
   try {
-    const pong = await bedrock.ping({ host: ip, port: port, timeout: 5000 }); // 5s timeout
-    const motdClean = (typeof pong.motd === 'string' ? pong.motd : pong.motd?.toString() || "No MOTD").replace(/§[0-9a-fk-or]/g, ""); // Strip colors
+    const pong = await bedrock.ping({ host: ip, port: port, timeout: 5000 });
+    const motdClean = (typeof pong.motd === 'string' ? pong.motd : pong.motd?.toString() || "No MOTD").replace(/§[0-9a-fk-or]/g, "");
     
     if (interaction) {
         await safeReply(interaction, `✅ **Server Online!**\n> **MOTD:** ${motdClean}\n> **Ver:** ${pong.version || "?"}\n> **Players:** ${pong.playersOnline}/${pong.playersMax}\n\n🚀 Connecting bot...`);
@@ -215,7 +280,7 @@ async function startSession(uid, interaction) {
     if (interaction) {
         return safeReply(interaction, `🛑 **Connection Cancelled: Server Unreachable**\nServer did not respond to ping.\nReason: \`${pingErr.message}\`\n\n*Check IP/Port or if server is booting.*`);
     }
-    return; // STOP execution here if ping fails
+    return; 
   }
 
   // --- 2. START CONNECTION ---
@@ -236,7 +301,6 @@ async function startSession(uid, interaction) {
     opts.profilesFolder = authDir;
   }
 
-  // Error trapping for creation phase
   let mc;
   try {
       mc = bedrock.createClient(opts);
@@ -253,8 +317,9 @@ async function startSession(uid, interaction) {
       startedAt: Date.now(), 
       manualStop: false, 
       connected: false, 
-      hasSpawned: false, // New flag for connection success
+      hasSpawned: false,
       isReconnecting: false,
+      gamertag: null, // Store gamertag here
       pos: { x: 0, y: 0, z: 0 },
       afkInterval: null,
       waitForEntity: null
@@ -263,7 +328,7 @@ async function startSession(uid, interaction) {
   } else {
     currentSession.client = mc;
     currentSession.isReconnecting = false;
-    currentSession.hasSpawned = false; // Reset on reconnect
+    currentSession.hasSpawned = false;
   }
 
   // Authority & Position Sync
@@ -273,8 +338,19 @@ async function startSession(uid, interaction) {
     }
   });
 
+  // Try to grab gamertag on login
+  mc.on('start_game', (packet) => {
+    // Usually invalid, but sometimes works. 
+    // Best way in bedrock-protocol usually involves checking the client object after handshake
+  });
+
   currentSession.waitForEntity = setInterval(() => {
     if (!mc.entity || !mc.entityId) return;
+    
+    // Attempt to grab connection identity for Admin Panel
+    if (mc.profile) currentSession.gamertag = mc.profile.name;
+    else if (u.connectionType === "offline") currentSession.gamertag = opts.username;
+    
     clearInterval(currentSession.waitForEntity);
     currentSession.waitForEntity = null;
 
@@ -310,7 +386,6 @@ async function startSession(uid, interaction) {
   currentSession.timeout = setTimeout(() => {
     if (sessions.has(uid) && !currentSession.connected) {
       if (interaction) safeReply(interaction, `❌ **Connection Timeout** at ${ip}:${port}.`);
-      // Use manualStop = true here to prevent auto-reconnect loop on timeout
       currentSession.manualStop = true;
       cleanupSession(uid);
     }
@@ -318,26 +393,27 @@ async function startSession(uid, interaction) {
 
   mc.on("spawn", () => {
     currentSession.connected = true;
-    currentSession.hasSpawned = true; // Mark as successfully entered world
+    currentSession.hasSpawned = true;
     clearTimeout(currentSession.timeout);
     if (interaction) {
         safeReply(interaction, `🟢 **Connected to ${ip}:${port}**\nAnti-AFK active.`);
     }
+    // Refresh admin dashboard if it exists
+    updateAdminDashboard();
   });
 
   mc.on("error", (e) => {
     clearTimeout(currentSession.timeout);
     console.error(`Session Error [${uid}]:`, e.message);
     if (!currentSession.manualStop) {
-        // Only reconnect if we actually spawned previously (was a valid connection)
         if (currentSession.hasSpawned) {
             handleAutoReconnect(uid, interaction);
         } else {
-            // Failed during handshake/login - STOP completely
             cleanupSession(uid);
             if (interaction) safeReply(interaction, `🛑 **Login Failed:** ${e.message}\nBot stopped (No retry).`);
         }
     }
+    updateAdminDashboard();
   });
 
   mc.on("close", () => {
@@ -346,11 +422,11 @@ async function startSession(uid, interaction) {
         if (currentSession.hasSpawned) {
              handleAutoReconnect(uid, interaction);
         } else {
-            // Closed before spawn (e.g., whitelist kick, full server)
             cleanupSession(uid);
             if (interaction) safeReply(interaction, `🛑 **Connection Closed before Join.**\nCheck whitelist/server status.`);
         }
     }
+    updateAdminDashboard();
   });
 }
 
@@ -360,15 +436,15 @@ function handleAutoReconnect(uid, interaction) {
 
     s.isReconnecting = true;
     s.connected = false;
-    // Keep hasSpawned true so we know this session WAS valid at some point
     
     if (s.afkInterval) clearInterval(s.afkInterval);
     if (s.waitForEntity) clearInterval(s.waitForEntity);
 
+    updateAdminDashboard(); // Update status to orange
+
     s.reconnectTimer = setTimeout(() => {
         if (sessions.has(uid) && !s.manualStop) {
             s.reconnectTimer = null;
-            // Recursively call startSession - logic inside will handle ping check again
             startSession(uid, null).catch(e => {
                 console.error("Auto-reconnect failed:", e);
                 cleanupSession(uid);
@@ -379,10 +455,32 @@ function handleAutoReconnect(uid, interaction) {
 
 // ----------------- Interaction Listeners -----------------
 client.on(Events.InteractionCreate, async (i) => {
-  if (!i.inGuild() || i.guildId !== ALLOWED_GUILD_ID) return;
   const uid = i.user.id;
 
   try {
+    // ADMIN COMMANDS
+    if (i.isChatInputCommand() && i.commandName === "admin") {
+        if (uid !== ADMIN_ID) return i.reply({ content: "⛔ Access Denied.", ephemeral: true });
+        
+        const data = await generateAdminView();
+        adminDashboardMessage = await i.reply({ ...data, fetchReply: true });
+        return;
+    }
+
+    // ADMIN REFRESH BUTTON
+    if (i.isButton() && i.customId === "admin_refresh") {
+        if (uid !== ADMIN_ID) return i.reply({ content: "⛔ Access Denied.", ephemeral: true });
+        await i.deferUpdate();
+        updateAdminDashboard();
+        return;
+    }
+
+    // PUBLIC COMMANDS (Check Guild)
+    if (!i.inGuild() || i.guildId !== ALLOWED_GUILD_ID) {
+        // Allow admin command in DM (handled above), block others
+        return;
+    }
+
     if (i.isChatInputCommand() && i.commandName === "panel") {
       return i.reply({ content: "🎛 **Bedrock AFK Management Console**", components: panelRow() });
     }
@@ -443,11 +541,18 @@ client.on(Events.InteractionCreate, async (i) => {
 
 client.once("ready", async () => {
   console.log(`🟢 System Online. Logged in as: ${client.user.tag}`);
-  await client.application.commands.set([new SlashCommandBuilder().setName("panel").setDescription("Open the AFK Bot Management Panel")]);
+  
+  const commands = [
+      new SlashCommandBuilder().setName("panel").setDescription("Open the AFK Bot Management Panel"),
+      new SlashCommandBuilder().setName("admin").setDescription("System Admin Dashboard")
+  ];
+  
+  await client.application.commands.set(commands);
 });
 
 process.on("unhandledRejection", (e) => console.error("Unhandled Rejection:", e));
 process.on("uncaughtException", (e) => console.error("Uncaught Exception:", e));
 
 client.login(DISCORD_TOKEN);
+
 
