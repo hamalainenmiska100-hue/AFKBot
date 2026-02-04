@@ -133,7 +133,7 @@ function destroySession(uid, type) {
     updateAdminDashboard();
 }
 
-// ----------------- MAP RENDERER (FEATURE 5) -----------------
+// ----------------- MAP RENDERER -----------------
 
 async function renderMap(bot) {
     if (!createCanvas) throw new Error("Canvas library missing.");
@@ -212,9 +212,6 @@ async function startBedrock(uid, interaction, versionOverride) {
         version: versionOverride === "auto" ? undefined : versionOverride,
         offline: u.connectionType === "offline",
         username: u.connectionType === "offline" ? (u.offlineUsername || `AFK_${uid.slice(-4)}`) : undefined,
-        // FEATURE 6: Skin Loading
-        // bedrock-protocol uses 'profilesFolder' to cache token & skin data. 
-        // If online mode + linked, it fetches skin from Xbox.
         profilesFolder: u.connectionType === "online" ? authDir : undefined,
         conLog: console.log
     };
@@ -277,28 +274,26 @@ async function startJava(uid, interaction, versionOverride) {
     
     await interaction.update({ content: `☕ **Connecting to ${ip}:${port}...**`, components: [], embeds: [] });
 
-    // FIX: Proper Auth Handling
     const authType = u.java.authType || 'offline';
     
     const options = {
         host: ip,
         port: port,
+        // FIX: Force false if "auto" to let mineflayer handle it, otherwise use string
         version: versionOverride === "auto" ? false : versionOverride,
         checkTimeoutInterval: 60 * 1000,
         keepAlive: true,
         hideErrors: false,
-        // Authentication Logic
         auth: authType, 
         username: authType === 'offline' ? (u.java.offlineUsername || `Java_${uid.slice(-4)}`) : undefined,
-        profilesFolder: getUserAuthDir(uid), // Cache Microsoft tokens
+        profilesFolder: getUserAuthDir(uid),
         
-        // CRITICAL FIX: Intercept Microsoft Code (NO CONSOLE)
+        // CRITICAL: Intercept Microsoft Code
         onMsaCode: (data) => {
             console.log(`[JAVA AUTH] Code received for ${uid}`);
             const row = new ActionRowBuilder().addComponents(
                 new ButtonBuilder().setLabel("Login to Microsoft").setStyle(ButtonStyle.Link).setURL(data.verification_uri)
             );
-            // Send as ephemeral message to user
             interaction.followUp({ 
                 content: `🔐 **Microsoft Authentication Required**\nCode: \`${data.user_code}\`\nClick the link below to authorize.`, 
                 components: [row],
@@ -337,10 +332,22 @@ function createJavaInstance(uid, opts, interaction) {
         startAfkLogic(uid, session, 'java');
     });
 
+    // KORJAUS: Tarkempi virheenkäsittely kuvassa näkyvälle virheelle
     bot.on('error', (err) => {
         console.log(`[JAVA ERR] ${uid}:`, err.message);
-        if (interaction && !session.connected) {
-             // Handle connection refusal vs auth error
+        
+        // Tunnista protocol version virhe (Kuvassa: Do not have protocol data for 774)
+        if (err.message.includes("protocol data") || err.message.includes("not supported")) {
+             if (interaction && !session.connected) {
+                 interaction.followUp({ 
+                     content: "❌ **Versiovirhe!** Palvelin käyttää versiota, jota automaattitunnistus ei tue. Ole hyvä ja valitse oikea versio (esim. 1.21.4) valikosta.", 
+                     ephemeral: true 
+                 });
+             }
+             // Pysäytä botti, ettei se jää jumiin
+             destroySession(uid, 'java');
+        }
+        else if (interaction && !session.connected) {
              if (err.message.includes('Invalid credentials')) {
                  interaction.followUp({ content: "❌ **Auth Error:** Invalid credentials or Cracked mode required.", ephemeral: true });
              }
@@ -349,6 +356,7 @@ function createJavaInstance(uid, opts, interaction) {
     
     bot.on('kicked', (reason) => {
         console.log(`[JAVA KICK] ${uid}:`, reason);
+        // Mineflayer automatically emits 'end'
     });
 
     bot.on('end', () => {
@@ -402,8 +410,6 @@ function handleDisconnect(uid, session, type) {
             const map = type === 'java' ? javaSessions : sessions;
             if (map.has(uid) && !map.get(uid).manualStop) {
                 console.log(`[${type.toUpperCase()}] Reconnecting ${uid} now...`);
-                // Pass existing interaction as null since we can't reply to it anymore easily
-                // or we could save the channel ID. For now, silent reconnect.
                 if (type === 'java') createJavaInstance(uid, session.opts, null);
                 else createBedrockInstance(uid, session.opts, null);
             } else {
@@ -416,10 +422,18 @@ function handleDisconnect(uid, session, type) {
 // ----------------- UI BUILDERS -----------------
 
 function getVersionSelector(type, current) {
+    // KORJAUS: Päivitetty versiolista vastaamaan nykypäivää (1.21.x)
     const jv = [
         { label: "Auto-Detect (Best)", value: "auto" },
-        { label: "1.21.4", value: "1.21.4" }, { label: "1.20.1", value: "1.20.1" },
-        { label: "1.16.5", value: "1.16.5" }, { label: "1.8.9", value: "1.8.9" }
+        { label: "1.21.4", value: "1.21.4" },
+        { label: "1.21.3", value: "1.21.3" },
+        { label: "1.21.1", value: "1.21.1" },
+        { label: "1.20.6", value: "1.20.6" },
+        { label: "1.20.4", value: "1.20.4" },
+        { label: "1.20.1", value: "1.20.1" },
+        { label: "1.19.4", value: "1.19.4" },
+        { label: "1.16.5", value: "1.16.5" },
+        { label: "1.8.9", value: "1.8.9" }
     ];
     const bv = [
         { label: "Auto-Detect (Best)", value: "auto" },
@@ -742,4 +756,5 @@ process.on("uncaughtException", (e) => console.error("Uncaught:", e));
 process.on("unhandledRejection", (e) => console.error("Unhandled:", e));
 
 client.login(DISCORD_TOKEN);
+
 
