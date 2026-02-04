@@ -10,7 +10,8 @@
     "discord.js": "^14.14.1",
     "bedrock-protocol": "^3.26.0",
     "mineflayer": "^4.20.0",
-    "prismarine-auth": "^2.3.0"
+    "prismarine-auth": "^2.3.0",
+    "canvas": "^2.11.2"
   },
   "scripts": {
     "start": "node bot.js",
