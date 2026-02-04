@@ -1,6 +1,6 @@
 /**
- * DM-ONLY MINECRAFT CLIENT CONTROLLER
- * Operates exclusively in Direct Messages.
+ * ULTIMATE MINECRAFT COMPANION
+ * Version: 6.0 (Social & Server Browser Edition)
  */
 
 const {
@@ -31,20 +31,16 @@ const path = require("path");
 const CONFIG = {
     TOKEN: process.env.DISCORD_TOKEN,
     ADMIN_ID: "1144987924123881564", 
-    SETUP_GUILD: "1462335230345089254", // Server where /setup works
+    SETUP_GUILD: "1462335230345089254",
     PATHS: {
         DATA: path.join(__dirname, "data"),
         AUTH: path.join(__dirname, "data", "auth"),
-        USERS: path.join(__dirname, "data", "users.json")
+        DB: path.join(__dirname, "data", "database.json")
     }
 };
 
-if (!CONFIG.TOKEN) {
-    console.error("Error: DISCORD_TOKEN is missing.");
-    process.exit(1);
-}
+if (!CONFIG.TOKEN) process.exit(1);
 
-// Ensure Storage
 if (!fs.existsSync(CONFIG.PATHS.DATA)) fs.mkdirSync(CONFIG.PATHS.DATA);
 if (!fs.existsSync(CONFIG.PATHS.AUTH)) fs.mkdirSync(CONFIG.PATHS.AUTH, { recursive: true });
 
@@ -52,412 +48,455 @@ if (!fs.existsSync(CONFIG.PATHS.AUTH)) fs.mkdirSync(CONFIG.PATHS.AUTH, { recursi
 // 2. DATA STORAGE
 // ==========================================
 
-class DataManager {
+class Database {
     constructor() {
-        this.users = {};
+        this.data = { users: {}, servers: [] };
         this.load();
     }
 
     load() {
         try {
-            if (fs.existsSync(CONFIG.PATHS.USERS)) {
-                this.users = JSON.parse(fs.readFileSync(CONFIG.PATHS.USERS, "utf8"));
+            if (fs.existsSync(CONFIG.PATHS.DB)) {
+                this.data = JSON.parse(fs.readFileSync(CONFIG.PATHS.DB, "utf8"));
             }
-        } catch (e) { this.users = {}; }
+            if (!this.data.servers) this.data.servers = [];
+        } catch (e) { this.save(); }
     }
 
     save() {
-        fs.writeFile(CONFIG.PATHS.USERS, JSON.stringify(this.users, null, 2), () => {});
+        fs.writeFile(CONFIG.PATHS.DB, JSON.stringify(this.data, null, 2), () => {});
     }
 
     getUser(uid) {
-        if (!this.users[uid]) this.users[uid] = {};
-        const u = this.users[uid];
+        if (!this.data.users[uid]) {
+            this.data.users[uid] = {
+                bedrock: { ip: null, port: 19132, username: `Bot_${uid.slice(-4)}` },
+                java: { ip: null, port: 19132, username: `Java_${uid.slice(-4)}` },
+                settings: { version: 'auto', connectionType: 'offline' },
+                linked: false
+            };
+            this.save();
+        }
+        return this.data.users[uid];
+    }
 
-        // Ensure defaults
-        if (!u.bedrock) u.bedrock = { ip: null, port: 19132, username: `Bot_${uid.slice(-4)}` };
-        if (!u.java) u.java = { ip: null, port: 19132, username: `Java_${uid.slice(-4)}` };
-        if (!u.settings) u.settings = { version: 'auto', connectionType: 'offline' };
-        
-        return u;
+    addServer(server) {
+        this.data.servers.push(server);
+        this.save();
+    }
+
+    getServers() {
+        return this.data.servers;
     }
 }
 
-const DB = new DataManager();
+const DB = new Database();
 
 // ==========================================
-// 3. MINECRAFT CLIENT ENGINE
+// 3. SOCIAL & MATCHMAKING SYSTEM
 // ==========================================
 
-class MinecraftClient {
-    constructor(uid, type, interaction) {
-        this.uid = uid;
-        this.type = type; // 'bedrock' or 'java'
-        this.interaction = interaction;
-        this.client = null;
-        this.afkInterval = null;
-        this.connected = false;
-    }
+const matchmakingQueue = new Set(); // Users waiting
+const activePairs = new Map(); // uid -> partner_uid
 
-    async connect() {
-        const user = DB.getUser(this.uid);
-        const config = this.type === 'java' ? user.java : user.bedrock;
-        const settings = user.settings;
-
-        if (!config.ip) {
-            return this.updateUI("❌ **Config Error:** Server IP is missing. Check settings.");
+class SocialManager {
+    static joinQueue(uid, interaction) {
+        if (activePairs.has(uid)) {
+            return interaction.reply({ content: "❌ You are already in a chat session. Disconnect first.", ephemeral: true });
+        }
+        
+        if (matchmakingQueue.has(uid)) {
+            matchmakingQueue.delete(uid);
+            return interaction.reply({ content: "🛑 Left the matchmaking queue.", ephemeral: true });
         }
 
-        // Notify user
-        await this.interaction.update({
-            content: `⏳ **Connecting to** \`${config.ip}:${config.port}\`...`,
-            embeds: [],
-            components: []
-        });
-
-        const options = {
-            host: config.ip,
-            port: parseInt(config.port),
-            connectTimeout: 30000,
-            skipPing: false,
-            offline: settings.connectionType === 'offline',
-            username: settings.connectionType === 'offline' ? config.username : undefined,
-            profilesFolder: settings.connectionType === 'online' ? path.join(CONFIG.PATHS.AUTH, this.uid) : undefined,
-            version: settings.version === 'auto' ? undefined : settings.version,
-            conLog: () => {} 
-        };
-
-        if (settings.connectionType === 'online' && !user.linked) {
-            return this.updateUI("❌ **Auth Error:** Microsoft account not linked.");
-        }
-
-        try {
-            this.client = bedrock.createClient(options);
-            this.handleEvents();
-        } catch (e) {
-            this.updateUI(`❌ **Init Error:** ${e.message}`);
-            SessionManager.remove(this.uid);
-        }
-    }
-
-    handleEvents() {
-        this.client.on('spawn', () => {
-            this.connected = true;
-            this.startAFK();
+        // Try match
+        if (matchmakingQueue.size > 0) {
+            // Match found!
+            const partnerId = matchmakingQueue.values().next().value;
+            matchmakingQueue.delete(partnerId);
             
-            const embed = new EmbedBuilder()
-                .setTitle("🟢 Connected")
-                .setDescription(`**Host:** ${this.client.options.host}\n**Protocol:** ${this.type.toUpperCase()}`)
-                .setColor(0x57F287);
-
-            const row = new ActionRowBuilder().addComponents(
-                new ButtonBuilder().setCustomId("disconnect").setLabel("Disconnect").setStyle(ButtonStyle.Danger).setEmoji("🔌"),
-                new ButtonBuilder().setCustomId("send_cmd").setLabel("Command").setStyle(ButtonStyle.Secondary).setEmoji("⌨️")
-            );
-
-            this.interaction.editReply({ content: "", embeds: [embed], components: [row] }).catch(()=>{});
-        });
-
-        this.client.on('close', () => {
-            if (this.connected) this.updateUI("⚠️ **Disconnected from server.**");
-            this.cleanup();
-        });
-
-        this.client.on('error', (err) => {
-            if (!this.connected) {
-                this.updateUI(`❌ **Connection Failed:** ${err.message}`);
-                this.cleanup();
-            }
-        });
-
-        this.client.on('kick', (p) => {
-            this.updateUI(`🛑 **Kicked:** ${p.message || 'Unknown reason'}`);
-            this.cleanup();
-        });
-    }
-
-    startAFK() {
-        this.afkInterval = setInterval(() => {
-            if (this.client) {
-                try {
-                    const yaw = (Date.now() % 360);
-                    this.client.write('player_auth_input', {
-                        pitch: 0, yaw: yaw, head_yaw: yaw,
-                        position: { x: 0, y: 0, z: 0 },
-                        move_vector: { x: 0, z: 0 },
-                        input_data: { _value: 0n },
-                        input_mode: 'mouse', play_mode: 'normal', tick: 0n, delta: { x: 0, y: 0, z: 0 }
-                    });
-                } catch (e) {}
-            }
-        }, 15000);
-    }
-
-    sendChat(msg) {
-        if (this.client && this.connected) {
-            this.client.write('text', {
-                type: 'chat',
-                needs_translation: false,
-                source_name: this.client.username,
-                xuid: '',
-                message: msg
+            this.createPair(uid, partnerId, interaction.client);
+            
+            return interaction.update({ 
+                content: null, 
+                embeds: [new EmbedBuilder().setTitle("🎉 Partner Found!").setDescription(`You are now chatting with <@${partnerId}>.\n\nEverything you type here will be sent to them.`).setColor(0x57F287)],
+                components: [this.getChatControls()]
+            });
+        } else {
+            // No match, wait
+            matchmakingQueue.add(uid);
+            return interaction.update({ 
+                content: null,
+                embeds: [new EmbedBuilder().setTitle("🔍 Searching for players...").setDescription("Waiting for someone else to join the queue...").setColor(0xFEE75C).setThumbnail("https://media.tenor.com/On7kvXhzml4AAAAj/loading-gif.gif")],
+                components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId("social_cancel").setLabel("Cancel Search").setStyle(ButtonStyle.Danger))]
             });
         }
     }
 
-    updateUI(msg) {
-        this.interaction.editReply({ content: msg, embeds: [], components: [] }).catch(()=>{});
+    static async createPair(userA, userB, client) {
+        activePairs.set(userA, userB);
+        activePairs.set(userB, userA);
+
+        const notify = async (targetId, partnerId) => {
+            try {
+                const u = await client.users.fetch(targetId);
+                await u.send({
+                    embeds: [new EmbedBuilder().setTitle("🎉 Partner Found!").setDescription(`You are connected with **<@${partnerId}>**!\n\n💬 **Chat Started:** Type logs to chat.\n🎮 **Play:** Use buttons below.`).setColor(0x57F287)],
+                    components: [this.getChatControls()]
+                });
+            } catch(e) {}
+        };
+
+        await notify(userB, userA); // User A gets notified via interaction update
     }
 
-    cleanup() {
-        if (this.afkInterval) clearInterval(this.afkInterval);
-        if (this.client) {
-            try { this.client.close(); } catch(e){}
-            this.client.removeAllListeners();
-            this.client = null;
+    static disconnect(uid, client) {
+        const partner = activePairs.get(uid);
+        if (partner) {
+            activePairs.delete(uid);
+            activePairs.delete(partner);
+            
+            [uid, partner].forEach(async id => {
+                try {
+                    const u = await client.users.fetch(id);
+                    u.send({ embeds: [new EmbedBuilder().setDescription("🛑 **Chat disconnected.**").setColor(0xED4245)] });
+                } catch(e){}
+            });
         }
-        this.connected = false;
-        SessionManager.remove(this.uid);
+    }
+
+    static getChatControls() {
+        return new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId("game_rps").setLabel("Rock Paper Scissors").setStyle(ButtonStyle.Primary).setEmoji("✂️"),
+            new ButtonBuilder().setCustomId("game_dice").setLabel("Roll Dice").setStyle(ButtonStyle.Secondary).setEmoji("🎲"),
+            new ButtonBuilder().setCustomId("social_leave").setLabel("Disconnect").setStyle(ButtonStyle.Danger).setEmoji("Bye")
+        );
+    }
+
+    static handleMessage(msg) {
+        const partner = activePairs.get(msg.author.id);
+        if (partner) {
+            msg.client.users.fetch(partner).then(u => {
+                u.send(`💬 **${msg.author.username}:** ${msg.content}`);
+            }).catch(()=>{});
+        }
     }
 }
 
 // ==========================================
-// 4. SESSION MANAGER
+// 4. MINECRAFT ENGINE (AFK)
 // ==========================================
 
-class SessionManager {
-    static sessions = new Map();
+class MinecraftSession {
+    constructor(uid, type, interaction) {
+        this.uid = uid;
+        this.type = type;
+        this.interaction = interaction;
+        this.client = null;
+        this.afkInt = null;
+    }
 
-    static start(uid, type, interaction) {
-        if (this.sessions.has(uid)) {
-            interaction.reply({ content: "❌ You already have a session active.", ephemeral: true });
-            return;
+    async start() {
+        const user = DB.getUser(this.uid);
+        const conf = this.type === 'java' ? user.java : user.bedrock;
+        
+        if(!conf.ip) return this.interaction.editReply("❌ No IP set. Go to Config.");
+
+        await this.interaction.editReply({ embeds: [new EmbedBuilder().setDescription(`⏳ Connecting to \`${conf.ip}\`...`).setColor(0xFEE75C)]});
+
+        const opts = {
+            host: conf.ip,
+            port: parseInt(conf.port),
+            offline: user.settings.connectionType === 'offline',
+            username: user.settings.connectionType === 'offline' ? conf.username : undefined,
+            profilesFolder: user.settings.connectionType === 'online' ? path.join(CONFIG.PATHS.AUTH, this.uid) : undefined,
+            skipPing: false,
+            connectTimeout: 20000,
+            conLog: ()=>{}
+        };
+
+        if(user.settings.connectionType === 'online' && !user.linked) {
+            return this.interaction.editReply("❌ Microsoft account not linked.");
         }
-        const session = new MinecraftClient(uid, type, interaction);
-        this.sessions.set(uid, session);
-        session.connect();
+
+        try {
+            this.client = bedrock.createClient(opts);
+            this.client.on('spawn', () => {
+                this.interaction.editReply({ 
+                    embeds: [new EmbedBuilder().setTitle("✅ Connected & AFK").setDescription(`Connected to **${conf.ip}**\nProtocol: ${this.type.toUpperCase()}`).setColor(0x57F287)],
+                    components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId("mc_disconnect").setLabel("Stop Bot").setStyle(ButtonStyle.Danger))]
+                });
+                this.afkInt = setInterval(() => {
+                    if(this.client) this.client.write('player_auth_input', { pitch:0, yaw:0, position:{x:0,y:0,z:0}, input_mode:'mouse' });
+                }, 15000);
+            });
+            this.client.on('error', (e) => this.interaction.editReply(`❌ Error: ${e.message}`));
+            this.client.on('close', () => this.stop());
+        } catch(e) { this.interaction.editReply(`❌ Init Error: ${e.message}`); }
     }
 
-    static stop(uid) {
-        const s = this.sessions.get(uid);
-        if (s) {
-            s.updateUI("⏹ **Stopped by user.**");
-            s.cleanup();
-        }
-    }
-
-    static remove(uid) {
-        this.sessions.delete(uid);
-    }
-
-    static get(uid) {
-        return this.sessions.get(uid);
+    stop() {
+        if(this.afkInt) clearInterval(this.afkInt);
+        if(this.client) { try{this.client.close();}catch(e){} }
+        SessionManager.delete(this.uid);
     }
 }
 
+const SessionManager = new Map();
+
 // ==========================================
-// 5. DISCORD LOGIC
+// 5. UI GENERATORS
 // ==========================================
 
-const client = new Client({
-    intents: [
-        GatewayIntentBits.Guilds,
-        GatewayIntentBits.DirectMessages
-    ],
-    partials: [Partials.Channel, Partials.Message]
-});
+const UI = {
+    navRow(current) {
+        const btns = [
+            { id: "nav_home", label: "Home", emoji: "🏠" },
+            { id: "nav_servers", label: "Servers", emoji: "🌐" },
+            { id: "nav_social", label: "Social", emoji: "👥" },
+            { id: "nav_config", label: "Config", emoji: "⚙️" }
+        ];
+        
+        return new ActionRowBuilder().addComponents(
+            btns.map(b => new ButtonBuilder()
+                .setCustomId(b.id)
+                .setLabel(b.label)
+                .setEmoji(b.emoji)
+                .setStyle(current === b.id ? ButtonStyle.Primary : ButtonStyle.Secondary)
+                .setDisabled(current === b.id)
+            )
+        );
+    },
 
-// --- UI HELPERS ---
+    home(uid) {
+        const user = DB.getUser(uid);
+        const session = SessionManager.get(uid);
+        
+        const embed = new EmbedBuilder()
+            .setTitle("🎮 Minecraft Companion")
+            .setDescription("Welcome back! Select an action below.")
+            .setColor(0x5865F2)
+            .addFields(
+                { name: "🤖 AFK Bot", value: session ? "🟢 **Running**" : "🔴 **Idle**", inline: true },
+                { name: "🔑 Account", value: user.linked ? "✅ Linked" : "⚠️ Offline", inline: true }
+            );
 
-function getMainMenuPayload() {
-    const embed = new EmbedBuilder()
-        .setTitle("Minecraft Control Panel")
-        .setDescription("Select a protocol to start. This bot only works in DMs.")
-        .setColor(0x2B2D31);
+        const controls = new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId("start_bedrock").setLabel("Start Bedrock").setStyle(ButtonStyle.Success).setEmoji("🧱").setDisabled(!!session),
+            new ButtonBuilder().setCustomId("start_java").setLabel("Start Java").setStyle(ButtonStyle.Success).setEmoji("☕").setDisabled(!!session),
+            new ButtonBuilder().setCustomId("mc_disconnect").setLabel("Stop").setStyle(ButtonStyle.Danger).setEmoji("🛑").setDisabled(!session)
+        );
 
-    const row = new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId("start_bedrock").setLabel("Bedrock").setStyle(ButtonStyle.Primary).setEmoji("🧱"),
-        new ButtonBuilder().setCustomId("start_java").setLabel("Java (Geyser)").setStyle(ButtonStyle.Success).setEmoji("☕"),
-        new ButtonBuilder().setCustomId("settings").setLabel("Settings").setStyle(ButtonStyle.Secondary).setEmoji("⚙️")
-    );
+        return { embeds: [embed], components: [controls, this.navRow("nav_home")] };
+    },
 
-    const row2 = new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId("link_account").setLabel("Link Microsoft").setStyle(ButtonStyle.Secondary)
-    );
+    servers() {
+        const list = DB.getServers();
+        const display = list.slice(-5).map(s => `🌐 **${s.ip}:${s.port}**\n📝 *${s.desc}*`).join("\n\n") || "No servers shared yet.";
 
-    return { embeds: [embed], components: [row, row2] };
-}
+        const embed = new EmbedBuilder()
+            .setTitle("🌐 Community Servers")
+            .setDescription(display)
+            .setColor(0x2B2D31)
+            .setFooter({ text: "Share your server to see it here!" });
 
-// --- EVENTS ---
+        const row = new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId("share_server").setLabel("Share Server").setStyle(ButtonStyle.Success).setEmoji("Tb"),
+            new ButtonBuilder().setCustomId("refresh_servers").setLabel("Refresh").setStyle(ButtonStyle.Secondary)
+        );
 
-client.on(Events.ClientReady, () => {
-    console.log(`Bot Active: ${client.user.tag}`);
-    client.application.commands.set([
-        new SlashCommandBuilder().setName("panel").setDescription("Open Control Panel"),
-        new SlashCommandBuilder().setName("setup").setDescription("Show Setup Message (Specific Server Only)")
-    ]);
-});
+        return { embeds: [embed], components: [row, this.navRow("nav_servers")] };
+    },
 
-// 1. DM HANDLER
+    social(uid) {
+        const inQueue = matchmakingQueue.has(uid);
+        const chatting = activePairs.has(uid);
+
+        const embed = new EmbedBuilder()
+            .setTitle("👥 Social Hub")
+            .setDescription("Find other Minecraft players, chat, and play mini-games directly in DMs.")
+            .addFields(
+                { name: "Status", value: chatting ? "💬 **In Chat**" : (inQueue ? "🔍 **Searching...**" : "💤 **Idle**"), inline: true },
+                { name: "Online", value: `${matchmakingQueue.size} searching`, inline: true }
+            )
+            .setColor(0xEB459E);
+
+        const row = new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId("social_find").setLabel(inQueue ? "Searching..." : "Find Partner").setStyle(inQueue ? ButtonStyle.Secondary : ButtonStyle.Success).setEmoji("🔍").setDisabled(inQueue || chatting),
+            new ButtonBuilder().setCustomId("social_cancel").setLabel("Cancel").setStyle(ButtonStyle.Danger).setDisabled(!inQueue)
+        );
+
+        return { embeds: [embed], components: [row, this.navRow("nav_social")] };
+    },
+
+    config(uid) {
+        const user = DB.getUser(uid);
+        const embed = new EmbedBuilder()
+            .setTitle("⚙️ Configuration")
+            .setDescription(`**Bedrock:** \`${user.bedrock.ip || 'None'}\`\n**Java:** \`${user.java.ip || 'None'}\``)
+            .setColor(0x2B2D31);
+
+        const row = new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId("edit_config").setLabel("Edit IP/Port").setStyle(ButtonStyle.Primary),
+            new ButtonBuilder().setCustomId("link_ms").setLabel("Link Microsoft").setStyle(ButtonStyle.Secondary).setDisabled(user.linked),
+            new ButtonBuilder().setCustomId("unlink_ms").setLabel("Unlink").setStyle(ButtonStyle.Danger).setDisabled(!user.linked)
+        );
+
+        return { embeds: [embed], components: [row, this.navRow("nav_config")] };
+    }
+};
+
+// ==========================================
+// 6. DISCORD LOGIC
+// ==========================================
+
+const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.DirectMessages], partials: [Partials.Channel] });
+
+// Message Relay
 client.on(Events.MessageCreate, async (msg) => {
-    if (msg.author.bot) return;
-    if (!msg.guild) {
-        await msg.reply(getMainMenuPayload());
+    if(msg.author.bot) return;
+    if(!msg.guild) {
+        // Chat Relay
+        SocialManager.handleMessage(msg);
+        // If sending panel command
+        if(msg.content.toLowerCase() === "panel" || msg.content.toLowerCase() === "/panel") {
+            await msg.reply(UI.home(msg.author.id));
+        }
     }
 });
 
-// 2. INTERACTION HANDLER
 client.on(Events.InteractionCreate, async (i) => {
     const uid = i.user.id;
 
-    // --- GUILD HANDLING ---
-    if (i.guildId) {
-        // Special logic for the Setup Guild
-        if (i.guildId === CONFIG.SETUP_GUILD) {
-            
-            // /setup Command
-            if (i.isChatInputCommand() && i.commandName === "setup") {
-                const row = new ActionRowBuilder().addComponents(
-                    new ButtonBuilder().setCustomId("trigger_dm").setLabel("Open a DM").setStyle(ButtonStyle.Primary).setEmoji("📩")
-                );
-                return i.reply({ content: "📢 **We've moved to DM only system.**", components: [row] });
-            }
-
-            // Open DM Button
-            if (i.isButton() && i.customId === "trigger_dm") {
-                try {
-                    await i.user.send(getMainMenuPayload());
-                    return i.reply({ content: "✅ **DM Opened!** Check your Direct Messages tab.", ephemeral: true });
-                } catch (e) {
-                    return i.reply({ content: "❌ **Could not DM you.** Please check your privacy settings.", ephemeral: true });
-                }
-            }
+    // Server Setup Command
+    if(i.guildId) {
+        if(i.guildId === CONFIG.SETUP_GUILD && i.commandName === "setup") {
+            return i.reply({
+                content: "🚀 **Launch App**",
+                components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId("dm_launch").setLabel("Open App").setStyle(ButtonStyle.Primary).setEmoji("📱"))]
+            });
         }
-
-        // Reject everything else in guilds
-        return i.reply({ content: "⛔ **This bot operates in DMs only.**", ephemeral: true });
+        if(i.customId === "dm_launch") {
+            try { await i.user.send(UI.home(uid)); i.reply({content: "✅ Check DMs!", ephemeral:true}); } 
+            catch { i.reply({content: "❌ Enable DMs!", ephemeral:true}); }
+            return;
+        }
+        return i.reply({content:"⛔ DMs only.", ephemeral:true});
     }
 
-    // --- DM HANDLING ---
     try {
-        if (i.isChatInputCommand() && i.commandName === "panel") {
-            return i.reply(getMainMenuPayload());
+        if(i.isChatInputCommand()) {
+            if(i.commandName === "panel") i.reply(UI.home(uid));
         }
 
-        if (i.isButton()) {
-            const id = i.customId;
+        if(i.isButton()) {
+            // NAV
+            if(i.customId === "nav_home") i.update(UI.home(uid));
+            if(i.customId === "nav_servers") i.update(UI.servers());
+            if(i.customId === "nav_social") i.update(UI.social(uid));
+            if(i.customId === "nav_config") i.update(UI.config(uid));
 
-            if (id === "start_bedrock" || id === "start_java") {
-                const type = id.split("_")[1];
-                const u = DB.getUser(uid);
-                const conf = type === 'java' ? u.java : u.bedrock;
-
-                const embed = new EmbedBuilder()
-                    .setTitle(`${type === 'java' ? 'Java' : 'Bedrock'} Launcher`)
-                    .setDescription(`**Target:** \`${conf.ip || 'Not Set'}:${conf.port}\`\n**User:** \`${conf.username}\`\n\nClick Launch to connect.`)
-                    .setColor(0x5865F2);
-
-                const row = new ActionRowBuilder().addComponents(
-                    new ButtonBuilder().setCustomId(`launch_${type}`).setLabel("Launch").setStyle(ButtonStyle.Success),
-                    new ButtonBuilder().setCustomId("cancel").setLabel("Cancel").setStyle(ButtonStyle.Secondary)
-                );
-
-                return i.reply({ embeds: [embed], components: [row], ephemeral: true });
+            // ACTIONS
+            if(i.customId.startsWith("start_")) {
+                const type = i.customId.split("_")[1];
+                await i.deferReply();
+                const session = new MinecraftSession(uid, type, i);
+                SessionManager.set(uid, session);
+                session.start();
             }
-
-            if (id.startsWith("launch_")) {
-                const type = id.split("_")[1];
-                await i.deferUpdate(); 
-                SessionManager.start(uid, type, i);
-                return;
-            }
-
-            if (id === "settings") {
-                const u = DB.getUser(uid);
-                const modal = new ModalBuilder().setCustomId("settings_modal").setTitle("Configuration");
-                modal.addComponents(
-                    new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("b_ip").setLabel("Bedrock IP").setStyle(TextInputStyle.Short).setValue(u.bedrock.ip || "").setRequired(false)),
-                    new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("j_ip").setLabel("Java IP").setStyle(TextInputStyle.Short).setValue(u.java.ip || "").setRequired(false)),
-                    new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("user").setLabel("Offline Username").setStyle(TextInputStyle.Short).setValue(u.bedrock.username).setRequired(true))
-                );
-                return i.showModal(modal);
-            }
-
-            if (id === "disconnect") {
-                i.deferUpdate();
-                SessionManager.stop(uid);
-            }
-
-            if (id === "send_cmd") {
-                const modal = new ModalBuilder().setCustomId("cmd_modal").setTitle("Send Command");
-                modal.addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("cmd_text").setLabel("Command (no /)").setStyle(TextInputStyle.Short).setRequired(true)));
-                return i.showModal(modal);
-            }
-
-            if (id === "link_account") return handleAuth(uid, i);
-            if (id === "cancel") return i.update({ content: "Cancelled.", embeds: [], components: [] });
-        }
-
-        if (i.isModalSubmit()) {
-            if (i.customId === "settings_modal") {
-                const u = DB.getUser(uid);
-                u.bedrock.ip = i.fields.getTextInputValue("b_ip");
-                u.java.ip = i.fields.getTextInputValue("j_ip");
-                const name = i.fields.getTextInputValue("user");
-                u.bedrock.username = name;
-                u.java.username = name;
-                DB.save();
-                return i.reply({ content: "✅ Settings saved.", ephemeral: true });
-            }
-
-            if (i.customId === "cmd_modal") {
+            if(i.customId === "mc_disconnect") {
                 const s = SessionManager.get(uid);
-                if (s && s.connected) {
-                    const cmd = i.fields.getTextInputValue("cmd_text");
-                    s.sendChat(`/${cmd}`);
-                    return i.reply({ content: `📤 Sent: /${cmd}`, ephemeral: true });
-                }
-                return i.reply({ content: "❌ Not connected.", ephemeral: true });
+                if(s) s.stop();
+                i.update(UI.home(uid));
+            }
+
+            // CONFIG
+            if(i.customId === "edit_config") {
+                const m = new ModalBuilder().setCustomId("conf_modal").setTitle("Config");
+                m.addComponents(
+                    new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("ip").setLabel("IP").setStyle(TextInputStyle.Short).setRequired(true)),
+                    new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("port").setLabel("Port").setStyle(TextInputStyle.Short).setValue("19132")),
+                    new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("user").setLabel("Username").setStyle(TextInputStyle.Short).setRequired(true))
+                );
+                i.showModal(m);
+            }
+            if(i.customId === "link_ms") handleAuth(uid, i);
+            if(i.customId === "unlink_ms") {
+                const u = DB.getUser(uid); u.linked = false; u.settings.connectionType='offline'; DB.save();
+                i.update(UI.config(uid));
+            }
+
+            // SERVERS
+            if(i.customId === "share_server") {
+                const m = new ModalBuilder().setCustomId("share_modal").setTitle("Share Server");
+                m.addComponents(
+                    new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("s_ip").setLabel("IP:Port").setStyle(TextInputStyle.Short).setRequired(true)),
+                    new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("s_desc").setLabel("Description").setStyle(TextInputStyle.Paragraph).setRequired(true))
+                );
+                i.showModal(m);
+            }
+            if(i.customId === "refresh_servers") i.update(UI.servers());
+
+            // SOCIAL
+            if(i.customId === "social_find") SocialManager.joinQueue(uid, i);
+            if(i.customId === "social_cancel") { matchmakingQueue.delete(uid); i.update(UI.social(uid)); }
+            if(i.customId === "social_leave") { SocialManager.disconnect(uid, i.client); i.update(UI.social(uid)); }
+            
+            // GAMES
+            if(i.customId === "game_rps") {
+                const moves = ["Rock 🪨", "Paper 📄", "Scissors ✂️"];
+                const move = moves[Math.floor(Math.random()*moves.length)];
+                const partner = activePairs.get(uid);
+                i.reply(`You played **${move}**!`);
+                if(partner) i.client.users.cache.get(partner)?.send(`🎮 Partner played **${move}**!`);
+            }
+            if(i.customId === "game_dice") {
+                const roll = Math.floor(Math.random()*6)+1;
+                const partner = activePairs.get(uid);
+                i.reply(`🎲 You rolled a **${roll}**!`);
+                if(partner) i.client.users.cache.get(partner)?.send(`🎲 Partner rolled a **${roll}**!`);
             }
         }
 
-    } catch (err) {
-        console.error("Interaction Error:", err);
-    }
+        if(i.isModalSubmit()) {
+            if(i.customId === "conf_modal") {
+                const u = DB.getUser(uid);
+                const ip = i.fields.getTextInputValue("ip");
+                const port = i.fields.getTextInputValue("port");
+                const usr = i.fields.getTextInputValue("user");
+                u.bedrock = {ip,port,username:usr};
+                u.java = {ip,port,username:usr};
+                DB.save();
+                i.update(UI.config(uid));
+            }
+            if(i.customId === "share_modal") {
+                const raw = i.fields.getTextInputValue("s_ip").split(":");
+                DB.addServer({ ip: raw[0], port: raw[1]||19132, desc: i.fields.getTextInputValue("s_desc") });
+                i.update(UI.servers());
+            }
+        }
+    } catch(e) { console.log(e); }
 });
 
-// --- AUTH ---
-const pendingAuth = new Map();
-
-function handleAuth(uid, interaction) {
-    if (pendingAuth.has(uid)) return interaction.reply({ content: "Auth pending.", ephemeral: true });
-    
-    const flow = new Authflow(uid, path.join(CONFIG.PATHS.AUTH, uid), { 
-        flow: "live", 
-        authTitle: Titles.MinecraftNintendoSwitch, 
-        deviceType: "Nintendo" 
-    }, async (res) => {
-        const row = new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setLabel("Login").setStyle(ButtonStyle.Link).setURL(res.verification_uri_complete || res.verification_uri)
-        );
-        interaction.editReply({ content: `**Code:** \`${res.user_code}\``, components: [row] }).catch(()=>{});
-    });
-
-    interaction.deferReply({ ephemeral: true });
-    pendingAuth.set(uid, true);
-
-    flow.getMsaToken().then(() => {
-        const u = DB.getUser(uid);
-        u.settings.connectionType = 'online';
-        u.linked = true;
-        DB.save();
-        interaction.followUp({ content: "✅ Account linked!", ephemeral: true });
-    }).catch(e => {
-        interaction.followUp({ content: `❌ Failed: ${e.message}`, ephemeral: true });
-    }).finally(() => {
-        pendingAuth.delete(uid);
+// Auth
+function handleAuth(uid, i) {
+    i.reply({content: "Check DMs for code.", ephemeral:true});
+    new Authflow(uid, path.join(CONFIG.PATHS.AUTH, uid), { flow:"live", authTitle:Titles.MinecraftNintendoSwitch, deviceType:"Nintendo"}, async (res) => {
+        i.user.send(`**Code:** \`${res.user_code}\`\n${res.verification_uri_complete}`);
+    }).getMsaToken().then(() => {
+        const u = DB.getUser(uid); u.linked=true; u.settings.connectionType='online'; DB.save();
+        i.user.send("✅ Linked!");
     });
 }
+
+client.once('ready', () => {
+    console.log("Online");
+    client.application.commands.set([
+        new SlashCommandBuilder().setName("panel").setDescription("App"),
+        new SlashCommandBuilder().setName("setup").setDescription("Setup")
+    ]);
+});
 
 client.login(CONFIG.TOKEN);
 
