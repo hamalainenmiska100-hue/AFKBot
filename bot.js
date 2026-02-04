@@ -15,19 +15,12 @@ const {
 } = require("discord.js");
 
 const bedrock = require("bedrock-protocol");
-const mineflayer = require("mineflayer");
 const { Authflow, Titles } = require("prismarine-auth");
 const fs = require("fs");
 const path = require("path");
 
-// --- MAP RENDER DEPENDENCY CHECK ---
-let createCanvas;
-try {
-    const canvasPkg = require('canvas');
-    createCanvas = canvasPkg.createCanvas;
-} catch (e) {
-    console.error("⚠️ 'canvas' kirjasto puuttuu. Karttaominaisuus ei toimi. Asenna: npm install canvas");
-}
+// IMPORT ROBUST SIMPLE CLIENT
+const SimpleClient = require('./SimpleClient');
 
 // ----------------- CRITICAL CONFIGURATION -----------------
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
@@ -59,7 +52,6 @@ try {
   users = {};
 }
 
-// Async save to prevent lag
 async function saveDatabase() {
     try {
         await fs.promises.writeFile(USER_FILE, JSON.stringify(users, null, 2));
@@ -80,10 +72,9 @@ function getUser(uid) {
       server: null,
       offlineUsername: `Java_${uid.slice(-4)}`,
       selectedVersion: "auto",
-      authType: "offline" // 'offline' (cracked) or 'microsoft'
+      authType: "offline"
     };
   }
-  // Migration for old users
   if (!users[uid].java.authType) users[uid].java.authType = "offline";
   
   return users[uid];
@@ -97,7 +88,7 @@ function getUserAuthDir(uid) {
 
 // ----------------- GLOBAL STATE -----------------
 const sessions = new Map();     // Bedrock
-const javaSessions = new Map(); // Java
+const javaSessions = new Map(); // Java (Now uses SimpleClient)
 const pendingAuth = new Map();  // Auth flows
 let adminDashboardMessage = null;
 
@@ -111,84 +102,29 @@ function destroySession(uid, type) {
     
     if (!s) return;
 
-    if (s.afkInterval) clearInterval(s.afkInterval);
+    // Clear interval tracking
     if (s.uptimeInterval) clearInterval(s.uptimeInterval);
     if (s.reconnectTimer) clearTimeout(s.reconnectTimer);
 
+    // Bedrock Cleanup
     try {
-        if (type === 'java' && s.bot) {
-            s.bot.end();
-            s.bot.removeAllListeners();
-        }
         if (type === 'bedrock' && s.client) {
             s.client.close();
             s.client.removeAllListeners();
         }
-    } catch (e) {
-        console.error(`Error closing ${type} session for ${uid}:`, e.message);
-    }
+    } catch (e) { console.error("Bedrock close error:", e.message); }
+
+    // Java Cleanup (SimpleClient)
+    try {
+        if (type === 'java' && s.simpleClient) {
+            s.simpleClient.disconnect();
+            s.simpleClient.removeAllListeners();
+        }
+    } catch (e) { console.error("Java close error:", e.message); }
 
     map.delete(uid);
     console.log(`[${type.toUpperCase()}] Session destroyed for ${uid}`);
     updateAdminDashboard();
-}
-
-// ----------------- MAP RENDERER -----------------
-
-async function renderMap(bot) {
-    if (!createCanvas) throw new Error("Canvas library missing.");
-    if (!bot || !bot.entity || !bot.entity.position) throw new Error("Bot not spawned or position unknown.");
-
-    const SIZE = 32; // Blocks radius
-    const SCALE = 8; // Pixels per block
-    const canvas = createCanvas(SIZE * 2 * SCALE, SIZE * 2 * SCALE);
-    const ctx = canvas.getContext('2d');
-
-    const center = bot.entity.position.floored();
-
-    // Draw Background
-    ctx.fillStyle = '#111';
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
-
-    for (let x = -SIZE; x < SIZE; x++) {
-        for (let z = -SIZE; z < SIZE; z++) {
-            // Find the highest non-air block roughly at bot's level
-            let block = null;
-            // Scan from head height down
-            for (let y = 5; y > -5; y--) {
-                const b = bot.blockAt(center.offset(x, y, z));
-                if (b && b.name !== 'air' && b.name !== 'void_air' && b.name !== 'cave_air') {
-                    block = b;
-                    break;
-                }
-            }
-
-            if (block) {
-                // Simple color mapping
-                let color = '#777'; // Stone gray
-                const n = block.name;
-                if (n.includes('grass')) color = '#4a8f28';
-                else if (n.includes('water')) color = '#28628f';
-                else if (n.includes('log')) color = '#4a3b2a';
-                else if (n.includes('leaves')) color = '#28591f';
-                else if (n.includes('sand')) color = '#d6cf8e';
-                else if (n.includes('snow')) color = '#fff';
-                else if (n.includes('dirt')) color = '#593d29';
-                else if (n.includes('lava')) color = '#cf550e';
-
-                ctx.fillStyle = color;
-                ctx.fillRect((x + SIZE) * SCALE, (z + SIZE) * SCALE, SCALE, SCALE);
-            }
-        }
-    }
-
-    // Draw Bot (Red Dot)
-    ctx.fillStyle = 'red';
-    ctx.beginPath();
-    ctx.arc(canvas.width / 2, canvas.height / 2, SCALE, 0, Math.PI * 2);
-    ctx.fill();
-
-    return canvas.toBuffer();
 }
 
 // ----------------- BEDROCK ENGINE -----------------
@@ -220,49 +156,54 @@ async function startBedrock(uid, interaction, versionOverride) {
         return interaction.followUp({ content: "❌ Microsoft Account not linked! Use 'Link Xbox' first.", ephemeral: true });
     }
 
-    createBedrockInstance(uid, options, interaction);
-}
-
-function createBedrockInstance(uid, opts, interaction) {
-    let client;
+    let bedClient;
     try {
-        client = bedrock.createClient(opts);
+        bedClient = bedrock.createClient(options);
     } catch (e) {
-        if (interaction) interaction.followUp({ content: `❌ Init Error: ${e.message}`, ephemeral: true });
-        return;
+        return interaction.followUp({ content: `❌ Init Error: ${e.message}`, ephemeral: true });
     }
 
     const session = {
-        client: client,
+        client: bedClient,
         connected: false,
         startTime: Date.now(),
         manualStop: false,
-        opts: opts,
+        opts: options,
         pos: { x: 0, y: 0, z: 0 },
         congratsHours: 0
     };
     sessions.set(uid, session);
 
-    client.on('spawn', () => {
+    bedClient.on('spawn', () => {
         session.connected = true;
-        console.log(`[BEDROCK] ${uid} spawned on ${opts.host}`);
-        if (interaction) interaction.followUp({ content: `✅ **Connected to ${opts.host}!**`, ephemeral: true });
+        console.log(`[BEDROCK] ${uid} spawned on ${options.host}`);
+        interaction.followUp({ content: `✅ **Connected to ${options.host}!**`, ephemeral: true });
         updateAdminDashboard();
-        startAfkLogic(uid, session, 'bedrock');
+        // Bedrock AFK logic is simple, handled here
+        session.afkInterval = setInterval(() => {
+            try {
+                const yaw = Math.random() * 360;
+                bedClient.write("player_auth_input", {
+                    pitch: 0, yaw: yaw, head_yaw: yaw,
+                    position: session.pos,
+                    move_vector: { x: 0, z: 0 },
+                    input_data: { _value: 0n },
+                    input_mode: 'mouse', play_mode: 'normal', tick: 0n, delta: { x: 0, y: 0, z: 0 }
+                });
+            } catch(e){}
+        }, 10000);
     });
 
-    client.on('error', (err) => console.log(`[BEDROCK ERR] ${uid}:`, err.message));
-
-    client.on('close', () => {
-        handleDisconnect(uid, session, 'bedrock');
+    bedClient.on('error', (err) => console.log(`[BEDROCK ERR] ${uid}:`, err.message));
+    bedClient.on('close', () => handleDisconnect(uid, session, 'bedrock'));
+    bedClient.on('move_player', (packet) => {
+        if (packet.runtime_id === bedClient.entityId) session.pos = packet.position;
     });
 
-    client.on('move_player', (packet) => {
-        if (packet.runtime_id === client.entityId) session.pos = packet.position;
-    });
+    startUptimeTracker(uid, session, 'bedrock');
 }
 
-// ----------------- JAVA ENGINE -----------------
+// ----------------- JAVA ENGINE (Using SimpleClient) -----------------
 
 async function startJava(uid, interaction, versionOverride) {
     const u = getUser(uid);
@@ -275,124 +216,73 @@ async function startJava(uid, interaction, versionOverride) {
     await interaction.update({ content: `☕ **Connecting to ${ip}:${port}...**`, components: [], embeds: [] });
 
     const authType = u.java.authType || 'offline';
-    
+
+    // 1. Prepare Options for SimpleClient
     const options = {
         host: ip,
         port: port,
-        version: versionOverride === "auto" ? false : versionOverride,
-        checkTimeoutInterval: 60 * 1000,
-        keepAlive: true,
-        hideErrors: false,
-        auth: authType, 
+        version: versionOverride, // 'auto' or specific string
+        auth: authType,
         username: authType === 'offline' ? (u.java.offlineUsername || `Java_${uid.slice(-4)}`) : undefined,
-        profilesFolder: getUserAuthDir(uid),
-        
-        // --- FIX 1: Add fakeHost to prevent ECONNRESET on some servers ---
-        fakeHost: ip, 
-
-        // CRITICAL: Intercept Microsoft Code
-        onMsaCode: (data) => {
-            console.log(`[JAVA AUTH] Code received for ${uid}`);
-            const row = new ActionRowBuilder().addComponents(
-                new ButtonBuilder().setLabel("Login to Microsoft").setStyle(ButtonStyle.Link).setURL(data.verification_uri)
-            );
-            interaction.followUp({ 
-                content: `🔐 **Microsoft Authentication Required**\nCode: \`${data.user_code}\`\nClick the link below to authorize.`, 
-                components: [row],
-                ephemeral: true 
-            });
-        }
+        profilesFolder: getUserAuthDir(uid) // For Microsoft Token caching
     };
 
-    createJavaInstance(uid, options, interaction);
-}
-
-function createJavaInstance(uid, opts, interaction) {
-    let bot;
-    try {
-        bot = mineflayer.createBot(opts);
-    } catch (e) {
-        if (interaction) interaction.followUp({ content: `❌ Init Error: ${e.message}`, ephemeral: true });
-        return;
-    }
-
+    // 2. Initialize SimpleClient
+    const simpleClient = new SimpleClient(options);
+    
     const session = {
-        bot: bot,
+        simpleClient: simpleClient,
         connected: false,
         startTime: Date.now(),
         manualStop: false,
-        opts: opts,
+        opts: options,
         congratsHours: 0
     };
     javaSessions.set(uid, session);
 
-    bot.once('spawn', () => {
+    // 3. Setup Bridge Listeners
+    simpleClient.on('spawn', () => {
         session.connected = true;
-        console.log(`[JAVA] ${uid} spawned on ${opts.host}`);
-        if (interaction) interaction.followUp({ content: `✅ **Connected to ${opts.host}!**`, ephemeral: true });
+        interaction.followUp({ content: `✅ **Connected to ${ip}!** (Using Robust Client)`, ephemeral: true });
         updateAdminDashboard();
-        startAfkLogic(uid, session, 'java');
+        startUptimeTracker(uid, session, 'java');
     });
 
-    bot.on('error', (err) => {
-        console.log(`[JAVA ERR] ${uid}:`, err.message);
-        
-        if (err.message.includes("protocol data") || err.message.includes("not supported")) {
-             if (interaction && !session.connected) {
-                 interaction.followUp({ 
-                     content: "❌ **Versiovirhe!** Valitse oikea Minecraft-versio valikosta 'Auto-Detect' sijaan.", 
-                     ephemeral: true 
-                 });
-             }
-             destroySession(uid, 'java');
-        }
-        else if (err.message.includes("ECONNRESET")) {
-            if (interaction && !session.connected) {
-                 interaction.followUp({ 
-                     content: "❌ **Yhteysvirhe (ECONNRESET):** Palvelin katkaisi yhteyden. Tämä johtuu yleensä IP-estosta (Fly.io) tai väärästä versiosta. Kokeile vaihtaa versio manuaalisesti.", 
-                     ephemeral: true 
-                 });
-            }
-        }
-        else if (interaction && !session.connected) {
+    simpleClient.on('msaCode', (data) => {
+         const row = new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setLabel("Login to Microsoft").setStyle(ButtonStyle.Link).setURL(data.verification_uri)
+        );
+        interaction.followUp({ 
+            content: `🔐 **Microsoft Authentication Required**\nCode: \`${data.user_code}\`\nClick the link below to authorize.`, 
+            components: [row],
+            ephemeral: true 
+        });
+    });
+
+    simpleClient.on('error', (err) => {
+        if (interaction && !session.connected) {
              if (err.message.includes('Invalid credentials')) {
-                 interaction.followUp({ content: "❌ **Auth Error:** Tarkista onko 'Cracked Mode' päällä tai onko Microsoft-tunnus oikein.", ephemeral: true });
+                 interaction.followUp({ content: "❌ **Auth Error:** Invalid credentials or 'Cracked Mode' required.", ephemeral: true });
+             } else if (err.message.includes("ECONNRESET")) {
+                 interaction.followUp({ content: "❌ **Connection Reset:** Server blocked the connection or version mismatch.", ephemeral: true });
+             } else {
+                 interaction.followUp({ content: `❌ **Error:** ${err.message}`, ephemeral: true });
              }
         }
     });
-    
-    bot.on('kicked', (reason) => {
-        console.log(`[JAVA KICK] ${uid}:`, reason);
-    });
 
-    bot.on('end', () => {
+    simpleClient.on('end', () => {
         handleDisconnect(uid, session, 'java');
     });
+
+    // 4. Trigger Connection
+    simpleClient.connect();
 }
+
 
 // ----------------- SHARED LOGIC -----------------
 
-function startAfkLogic(uid, session, type) {
-    session.afkInterval = setInterval(() => {
-        try {
-            if (type === 'java' && session.bot?.entity) {
-                session.bot.setControlState('jump', true);
-                session.bot.look(Math.random() * Math.PI, Math.random() * Math.PI);
-                setTimeout(() => { if (session.bot) session.bot.setControlState('jump', false); }, 500);
-            } 
-            else if (type === 'bedrock' && session.client) {
-                const yaw = Math.random() * 360;
-                session.client.write("player_auth_input", {
-                    pitch: 0, yaw: yaw, head_yaw: yaw,
-                    position: session.pos,
-                    move_vector: { x: 0, z: 0 },
-                    input_data: { _value: 0n },
-                    input_mode: 'mouse', play_mode: 'normal', tick: 0n, delta: { x: 0, y: 0, z: 0 }
-                });
-            }
-        } catch (e) { }
-    }, 10000);
-
+function startUptimeTracker(uid, session, type) {
     session.uptimeInterval = setInterval(async () => {
         session.congratsHours++;
         try {
@@ -403,7 +293,6 @@ function startAfkLogic(uid, session, type) {
 }
 
 function handleDisconnect(uid, session, type) {
-    if (session.afkInterval) clearInterval(session.afkInterval);
     if (session.uptimeInterval) clearInterval(session.uptimeInterval);
 
     if (session.manualStop) {
@@ -416,8 +305,28 @@ function handleDisconnect(uid, session, type) {
             const map = type === 'java' ? javaSessions : sessions;
             if (map.has(uid) && !map.get(uid).manualStop) {
                 console.log(`[${type.toUpperCase()}] Reconnecting ${uid} now...`);
-                if (type === 'java') createJavaInstance(uid, session.opts, null);
-                else createBedrockInstance(uid, session.opts, null);
+                if (type === 'java') {
+                    // Create new SimpleClient instance
+                    destroySession(uid, 'java'); // Clean old one first
+                    // We need to re-trigger startJava logic, but interaction is gone.
+                    // Simplified: We recreate the session manually.
+                    // Note: This simple recursive logic might need the original interaction for full UI feedback,
+                    // but for reconnects, console logs are fine.
+                    const u = getUser(uid);
+                    const opts = session.opts;
+                    const newClient = new SimpleClient(opts);
+                    // Attach basic listeners for reconnect
+                    newClient.on('spawn', () => { 
+                        const newSess = { simpleClient: newClient, connected: true, startTime: Date.now(), opts: opts, congratsHours: session.congratsHours };
+                        javaSessions.set(uid, newSess);
+                        startUptimeTracker(uid, newSess, 'java');
+                    });
+                    newClient.on('end', () => handleDisconnect(uid, javaSessions.get(uid), 'java'));
+                    newClient.connect();
+                } 
+                else {
+                    createBedrockInstance(uid, session.opts, null);
+                }
             } else {
                 destroySession(uid, type);
             }
@@ -513,7 +422,6 @@ client.on(Events.InteractionCreate, async (i) => {
                 const ver = type === "java" ? u.java.selectedVersion : u.bedrockVersion;
                 const verRow = getVersionSelector(type, ver);
                 
-                // Show Auth Status for Java
                 let content = `**Pre-Flight Check (${type === 'java' ? 'Java' : 'Bedrock'})**\nTarget: \`${serverData.ip}:${serverData.port}\``;
                 if (type === 'java') {
                     content += `\nAuth Mode: **${u.java.authType.toUpperCase()}**`;
@@ -622,12 +530,10 @@ client.on(Events.InteractionCreate, async (i) => {
                 
                 const val = i.values[0];
                 if (val === "coords") {
-                    let pos = isJava ? s.bot?.entity?.position : s.pos;
-                    if (!pos) pos = { x: 0, y: 0, z: 0 };
-                    return i.reply({ content: `📍 **Position:** ${Math.floor(pos.x)}, ${Math.floor(pos.y)}, ${Math.floor(pos.z)}`, ephemeral: true });
+                    return i.reply({ content: `📍 **Position:** (Not available in Simple Mode)`, ephemeral: true });
                 }
                 if (val === "reconnect") {
-                    if (isJava) s.bot.end(); else s.client.close();
+                    if (isJava) s.simpleClient.disconnect(); else s.client.close();
                     return i.reply({ content: "🔄 **Restarting session...**", ephemeral: true });
                 }
                 if (val === "cmd") {
@@ -636,17 +542,8 @@ client.on(Events.InteractionCreate, async (i) => {
                     m.addComponents(new ActionRowBuilder().addComponents(inp));
                     return i.showModal(m);
                 }
-                // --- MAP RENDER TRIGGER ---
                 if (val === "map_render") {
-                    if (!isJava) return i.reply({ content: "❌ Map render is currently Java only.", ephemeral: true });
-                    await i.deferReply({ ephemeral: true });
-                    try {
-                        const buffer = await renderMap(s.bot);
-                        const file = new AttachmentBuilder(buffer, { name: 'map.png' });
-                        await i.editReply({ content: "🗺️ **Surroundings:**", files: [file] });
-                    } catch (e) {
-                        await i.editReply({ content: `❌ Render Failed: ${e.message}` });
-                    }
+                    return i.reply({ content: "❌ Map render is disabled in Robust Mode to save memory.", ephemeral: true });
                 }
             }
         }
@@ -665,7 +562,6 @@ client.on(Events.InteractionCreate, async (i) => {
                 u.java.offlineUsername = i.fields.getTextInputValue("user");
                 saveDatabase();
                 
-                // Offer Auth Switch immediately
                 const row = new ActionRowBuilder().addComponents(
                     new ButtonBuilder().setCustomId("toggle_auth").setLabel(`Switch Auth Mode (Current: ${u.java.authType})`).setStyle(ButtonStyle.Secondary)
                 );
@@ -678,8 +574,8 @@ client.on(Events.InteractionCreate, async (i) => {
                 const cmd = i.fields.getTextInputValue("txt");
                 
                 if (s) {
-                    if (isJava && s.bot) s.bot.chat(`/${cmd}`);
-                    if (!isJava && s.client) s.client.write("command_request", { command: `/${cmd}`, origin: { type: 0, uuid: "", request_id: "", player_entity_id: undefined }, internal: false, version: 52 });
+                    if (isJava) s.simpleClient.chat(`/${cmd}`);
+                    else s.client.write("command_request", { command: `/${cmd}`, origin: { type: 0, uuid: "", request_id: "", player_entity_id: undefined }, internal: false, version: 52 });
                     return i.reply({ content: `📤 Sent: /${cmd}`, ephemeral: true });
                 }
                 return i.reply({ content: "❌ Session lost.", ephemeral: true });
@@ -691,27 +587,7 @@ client.on(Events.InteractionCreate, async (i) => {
     }
 });
 
-// ----------------- HELPERS -----------------
-
-function getTechMenu(type) {
-    const opts = [
-        { label: "View Coordinates", value: "coords" },
-        { label: "Send Command", value: "cmd" },
-        { label: "Force Reconnect", value: "reconnect" }
-    ];
-    if (type === 'java') {
-        opts.push({ label: "🗺️ Render Map", value: "map_render" });
-    }
-
-    return new ActionRowBuilder().addComponents(
-        new StringSelectMenuBuilder()
-            .setCustomId(type === 'java' ? "act_java" : "act_bedrock")
-            .setPlaceholder("Select Action")
-            .addOptions(opts)
-    );
-}
-
-async function handleLink(uid, interaction) {
+function handleLink(uid, interaction) {
     if (pendingAuth.has(uid)) return interaction.reply({ content: "⏳ Auth already pending.", ephemeral: true });
     
     const flow = new Authflow(uid, getUserAuthDir(uid), { flow: "live", authTitle: Titles.MinecraftNintendoSwitch, deviceType: "Nintendo" }, async (res) => {
@@ -720,20 +596,19 @@ async function handleLink(uid, interaction) {
         interaction.editReply({ content: `🔐 **Code:** \`${res.user_code}\``, components: [row] }).catch(()=>{});
     });
 
-    await interaction.deferReply({ ephemeral: true });
+    interaction.deferReply({ ephemeral: true });
     pendingAuth.set(uid, true);
 
-    try {
-        await flow.getMsaToken();
+    flow.getMsaToken().then(() => {
         const u = getUser(uid);
         u.linked = true;
         saveDatabase();
         interaction.followUp({ content: "✅ **Linked Successfully!**", ephemeral: true });
-    } catch (e) {
+    }).catch(e => {
         interaction.followUp({ content: `❌ Auth Failed: ${e.message}`, ephemeral: true });
-    } finally {
+    }).finally(() => {
         pendingAuth.delete(uid);
-    }
+    });
 }
 
 async function generateAdminData() {
@@ -761,4 +636,5 @@ process.on("uncaughtException", (e) => console.error("Uncaught:", e));
 process.on("unhandledRejection", (e) => console.error("Unhandled:", e));
 
 client.login(DISCORD_TOKEN);
+
 
