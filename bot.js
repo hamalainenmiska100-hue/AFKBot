@@ -1,6 +1,6 @@
 /**
  * AFKBot Panel 🎛️
- * Simple, clean, Bedrock-only edition.
+ * Simple, clean, Bedrock-only edition with Rejoin & MOTD.
  */
 
 const {
@@ -104,20 +104,46 @@ function getPanel(uid) {
 
 // --- MINECRAFT LOGIC ---
 
-async function startBot(uid, interaction) {
+async function startBot(uid, interaction = null, isReconnect = false) {
     const user = getUser(uid);
 
-    if (!user.ip) {
-        return interaction.reply({ content: "❌ IP address is missing. Go to **Settings**.", ephemeral: true });
+    // Initial Interaction Handling
+    if (!isReconnect && interaction) {
+        if (!user.ip) {
+            return interaction.reply({ content: "❌ IP address is missing. Go to **Settings**.", ephemeral: true });
+        }
+        await interaction.reply({ content: `🚀 **Connecting to** \`${user.ip}:${user.port}\`...`, ephemeral: true });
     }
 
-    await interaction.reply({ content: `🚀 **Connecting to** \`${user.ip}:${user.port}\`...`, ephemeral: true });
+    // --- MOTD CHECK (Server Status) ---
+    try {
+        if (isReconnect) console.log(`[${uid}] Reconnecting ping check...`);
+        // Ping with short timeout
+        await bedrock.ping({ host: user.ip, port: parseInt(user.port), skipPing: false, connectTimeout: 5000 });
+    } catch (e) {
+        const errorMsg = `❌ **Could not join server!**\nTarget: \`${user.ip}:${user.port}\`\nReason: Server might be offline or unreachable.`;
+        
+        // Notify User
+        if (!isReconnect && interaction) {
+            interaction.editReply({ content: errorMsg });
+        } else {
+            try {
+                const discordUser = await client.users.fetch(uid);
+                discordUser.send(errorMsg);
+            } catch (err) {}
+        }
+        
+        // Remove session if exists so we don't loop forever on a dead server
+        if (sessions.has(uid)) sessions.delete(uid);
+        return;
+    }
 
+    // --- CONNECTION ---
     const options = {
         host: user.ip,
         port: parseInt(user.port),
         connectTimeout: 30000,
-        skipPing: false,
+        skipPing: true, // We already pinged above
         offline: !user.onlineMode,
         username: !user.onlineMode ? user.username : undefined,
         profilesFolder: user.onlineMode ? path.join(CONFIG.PATHS.AUTH, uid) : undefined,
@@ -127,14 +153,25 @@ async function startBot(uid, interaction) {
     try {
         const bedrockClient = bedrock.createClient(options);
         
+        // Session Setup
         const session = {
             client: bedrockClient,
-            afkInt: null
+            afkInt: null,
+            manualStop: false // Track if user clicked stop
         };
         sessions.set(uid, session);
 
+        // --- EVENTS ---
+
         bedrockClient.on('spawn', () => {
-            interaction.editReply({ content: `✅ **Connected to ${user.ip}!**` });
+            console.log(`[${uid}] Spawned`);
+            
+            if (!isReconnect && interaction) {
+                interaction.editReply({ content: `✅ **Connected to ${user.ip}!**` });
+            } else if (isReconnect) {
+                // Optional: Notify on successful reconnect
+                client.users.fetch(uid).then(u => u.send(`♻️ **Reconnected** successfully to \`${user.ip}\`!`)).catch(()=>{});
+            }
             
             // Simple AFK Rotation
             session.afkInt = setInterval(() => {
@@ -148,22 +185,55 @@ async function startBot(uid, interaction) {
         });
 
         bedrockClient.on('error', (e) => {
-            interaction.editReply({ content: `❌ **Error:** ${e.message}` });
-            stopBot(uid);
+            console.log(`[${uid}] Error: ${e.message}`);
+            // Let close event handle the restart logic
         });
 
         bedrockClient.on('close', () => {
-            stopBot(uid);
+            console.log(`[${uid}] Connection Closed`);
+            handleDisconnect(uid);
+        });
+
+        bedrockClient.on('kick', (packet) => {
+             console.log(`[${uid}] Kicked: ${packet.message}`);
+             // Kick also triggers close usually, but logging helps
         });
 
     } catch (e) {
-        interaction.editReply({ content: `❌ **Init Error:** ${e.message}` });
+        if (!isReconnect && interaction) interaction.editReply({ content: `❌ **Init Error:** ${e.message}` });
+    }
+}
+
+function handleDisconnect(uid) {
+    const session = sessions.get(uid);
+    if (!session) return;
+
+    // Stop timers
+    if (session.afkInt) clearInterval(session.afkInt);
+
+    if (session.manualStop) {
+        // User clicked Stop - Clean up and exit
+        sessions.delete(uid);
+    } else {
+        // Accidental disconnect - REJOIN LOGIC
+        console.log(`[${uid}] Auto-reconnecting in 20s...`);
+        
+        // Notify user via DM about drop
+        client.users.fetch(uid).then(u => u.send(`⚠️ **Connection Lost.** Attempting to rejoin in 20 seconds...`)).catch(()=>{});
+
+        setTimeout(() => {
+            // Check if user stopped it while waiting
+            if (sessions.has(uid) && !sessions.get(uid).manualStop) {
+                startBot(uid, null, true); // true = isReconnect
+            }
+        }, 20000);
     }
 }
 
 function stopBot(uid) {
     const session = sessions.get(uid);
     if (session) {
+        session.manualStop = true; // Flag as manual stop to prevent rejoin
         if (session.afkInt) clearInterval(session.afkInt);
         try { session.client.close(); } catch(e){}
         sessions.delete(uid);
@@ -190,11 +260,11 @@ client.on(Events.InteractionCreate, async (i) => {
 
         // Buttons
         if (i.isButton()) {
-            if (i.customId === "start") return startBot(uid, i);
+            if (i.customId === "start") return startBot(uid, i, false);
             
             if (i.customId === "stop") {
                 stopBot(uid);
-                return i.reply({ content: "⏹ **Bot Stopped.**", ephemeral: true });
+                return i.reply({ content: "⏹ **Bot Stopped.** (Auto-rejoin disabled)", ephemeral: true });
             }
 
             if (i.customId === "settings") {
