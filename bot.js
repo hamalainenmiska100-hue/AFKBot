@@ -279,7 +279,6 @@ async function startJava(uid, interaction, versionOverride) {
     const options = {
         host: ip,
         port: port,
-        // FIX: Force false if "auto" to let mineflayer handle it, otherwise use string
         version: versionOverride === "auto" ? false : versionOverride,
         checkTimeoutInterval: 60 * 1000,
         keepAlive: true,
@@ -288,6 +287,9 @@ async function startJava(uid, interaction, versionOverride) {
         username: authType === 'offline' ? (u.java.offlineUsername || `Java_${uid.slice(-4)}`) : undefined,
         profilesFolder: getUserAuthDir(uid),
         
+        // --- FIX 1: Add fakeHost to prevent ECONNRESET on some servers ---
+        fakeHost: ip, 
+
         // CRITICAL: Intercept Microsoft Code
         onMsaCode: (data) => {
             console.log(`[JAVA AUTH] Code received for ${uid}`);
@@ -332,31 +334,35 @@ function createJavaInstance(uid, opts, interaction) {
         startAfkLogic(uid, session, 'java');
     });
 
-    // KORJAUS: Tarkempi virheenkäsittely kuvassa näkyvälle virheelle
     bot.on('error', (err) => {
         console.log(`[JAVA ERR] ${uid}:`, err.message);
         
-        // Tunnista protocol version virhe (Kuvassa: Do not have protocol data for 774)
         if (err.message.includes("protocol data") || err.message.includes("not supported")) {
              if (interaction && !session.connected) {
                  interaction.followUp({ 
-                     content: "❌ **Versiovirhe!** Palvelin käyttää versiota, jota automaattitunnistus ei tue. Ole hyvä ja valitse oikea versio (esim. 1.21.4) valikosta.", 
+                     content: "❌ **Versiovirhe!** Valitse oikea Minecraft-versio valikosta 'Auto-Detect' sijaan.", 
                      ephemeral: true 
                  });
              }
-             // Pysäytä botti, ettei se jää jumiin
              destroySession(uid, 'java');
+        }
+        else if (err.message.includes("ECONNRESET")) {
+            if (interaction && !session.connected) {
+                 interaction.followUp({ 
+                     content: "❌ **Yhteysvirhe (ECONNRESET):** Palvelin katkaisi yhteyden. Tämä johtuu yleensä IP-estosta (Fly.io) tai väärästä versiosta. Kokeile vaihtaa versio manuaalisesti.", 
+                     ephemeral: true 
+                 });
+            }
         }
         else if (interaction && !session.connected) {
              if (err.message.includes('Invalid credentials')) {
-                 interaction.followUp({ content: "❌ **Auth Error:** Invalid credentials or Cracked mode required.", ephemeral: true });
+                 interaction.followUp({ content: "❌ **Auth Error:** Tarkista onko 'Cracked Mode' päällä tai onko Microsoft-tunnus oikein.", ephemeral: true });
              }
         }
     });
     
     bot.on('kicked', (reason) => {
         console.log(`[JAVA KICK] ${uid}:`, reason);
-        // Mineflayer automatically emits 'end'
     });
 
     bot.on('end', () => {
@@ -422,7 +428,6 @@ function handleDisconnect(uid, session, type) {
 // ----------------- UI BUILDERS -----------------
 
 function getVersionSelector(type, current) {
-    // KORJAUS: Päivitetty versiolista vastaamaan nykypäivää (1.21.x)
     const jv = [
         { label: "Auto-Detect (Best)", value: "auto" },
         { label: "1.21.4", value: "1.21.4" },
@@ -756,5 +761,4 @@ process.on("uncaughtException", (e) => console.error("Uncaught:", e));
 process.on("unhandledRejection", (e) => console.error("Unhandled:", e));
 
 client.login(DISCORD_TOKEN);
-
 
