@@ -1,7 +1,7 @@
 {
   "name": "bedrock-java-afk-bot",
-  "version": "26.0.0",
-  "description": "Ultimate AFK bot",
+  "version": "27.0.0",
+  "description": "Robust and lightweight AFK bot for Bedrock and Java Edition",
   "main": "bot.js",
   "engines": {
     "node": ">=22.0.0"
@@ -9,7 +9,6 @@
   "dependencies": {
     "discord.js": "^14.15.3",
     "bedrock-protocol": "latest",
-    "mineflayer": "latest",
     "minecraft-protocol": "latest",
     "prismarine-auth": "^2.4.0",
     "canvas": "^2.11.2"
@@ -18,5 +17,3 @@
     "start": "node bot.js"
   }
 }
-
-
