@@ -1,6 +1,6 @@
 /**
  * AFKBot Panel 🎛️
- * Fixed Unlink Logic & Token Clearing.
+ * Fixed Auth Link & Settings Modal.
  */
 
 const {
@@ -111,7 +111,7 @@ async function startBot(uid, interaction = null, isReconnect = false) {
         if (isReconnect) console.log(`[${uid}] Reconnecting...`);
         await bedrock.ping({ host: user.ip, port: parseInt(user.port), skipPing: false, connectTimeout: 5000 });
     } catch (e) {
-        const msg = `❌ **Connection Failed!** Server \`${user.ip}\` is offline.`;
+        const msg = `❌ **Connection Failed!** Server \`${user.ip}\` is offline or unreachable.`;
         if (!isReconnect && interaction) interaction.editReply({ content: msg });
         else notifyUser(uid, msg);
         
@@ -125,9 +125,9 @@ async function startBot(uid, interaction = null, isReconnect = false) {
         port: parseInt(user.port),
         connectTimeout: 30000,
         skipPing: true,
-        offline: !user.onlineMode, // Important: If onlineMode is false, force offline
-        username: !user.onlineMode ? user.username : undefined, // Only send username in offline mode
-        profilesFolder: user.onlineMode ? path.join(CONFIG.PATHS.AUTH, uid) : undefined, // Only use cache in online mode
+        offline: !user.onlineMode, 
+        username: !user.onlineMode ? user.username : undefined, 
+        profilesFolder: user.onlineMode ? path.join(CONFIG.PATHS.AUTH, uid) : undefined, 
         conLog: () => {} 
     };
 
@@ -239,7 +239,9 @@ client.on(Events.InteractionCreate, async (i) => {
                 return i.reply({ content: stopped ? "⏹ **Bot Stopped.**" : "⚠️ **No bot running.**", ephemeral: true });
             }
 
+            // --- CONFIG BUTTON FIX ---
             if (i.customId === "settings") {
+                // DO NOT deferReply here, modals must be the first response!
                 const u = getUser(uid);
                 const modal = new ModalBuilder().setCustomId("settings_modal").setTitle("Bot Configuration");
                 modal.addComponents(
@@ -252,24 +254,18 @@ client.on(Events.InteractionCreate, async (i) => {
 
             if (i.customId === "link") return handleLink(uid, i);
             
-            // --- FIX FOR UNLINK ---
             if (i.customId === "unlink") {
                 const u = getUser(uid);
-                
-                // 1. Update Database
                 u.linked = false;
                 u.onlineMode = false;
                 saveUsers();
 
-                // 2. FORCE DELETE TOKEN FOLDER
                 const authPath = path.join(CONFIG.PATHS.AUTH, uid);
                 try {
                     if (fs.existsSync(authPath)) {
                         fs.rmSync(authPath, { recursive: true, force: true });
                     }
-                } catch(e) {
-                    console.error("Failed to delete tokens:", e);
-                }
+                } catch(e) { console.error("Failed to delete tokens:", e); }
 
                 return i.reply({ content: "🗑️ **Unlinked!** Tokens deleted. Bot will now join as Offline User.", ephemeral: true });
             }
@@ -287,13 +283,14 @@ client.on(Events.InteractionCreate, async (i) => {
     } catch (e) { console.error(e); }
 });
 
+// --- AUTH LOGIC FIX ---
 async function handleLink(uid, i) {
     if (pendingAuth.has(uid)) return i.reply({ content: "Auth already in progress.", ephemeral: true });
     
     await i.deferReply({ ephemeral: true });
     pendingAuth.add(uid);
 
-    // Clear any existing tokens before starting new link to avoid conflicts
+    // Clear old tokens
     try {
         const authPath = path.join(CONFIG.PATHS.AUTH, uid);
         if (fs.existsSync(authPath)) fs.rmSync(authPath, { recursive: true, force: true });
@@ -302,8 +299,16 @@ async function handleLink(uid, i) {
     const flow = new Authflow(uid, path.join(CONFIG.PATHS.AUTH, uid), { 
         flow: "live", authTitle: Titles.MinecraftNintendoSwitch, deviceType: "Nintendo" 
     }, async (res) => {
+        // FIX: Ensure a fallback URL is used if verification_uri_complete is missing
+        const link = res.verification_uri_complete || res.verification_uri || "https://microsoft.com/link";
+        
+        const row = new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setLabel("Login to Microsoft").setStyle(ButtonStyle.Link).setURL(link)
+        );
+
         i.editReply({ 
-            content: `**1.** Click: [Login to Microsoft](${res.verification_uri_complete})\n**2.** Code: \`${res.user_code}\`\n**3.** Wait here...` 
+            content: `**Action Required:**\n1. Click the button below.\n2. Enter code: \`${res.user_code}\`\n3. Wait here...`,
+            components: [row]
         });
     });
 
@@ -315,7 +320,7 @@ async function handleLink(uid, i) {
         saveUsers();
         i.followUp({ content: "✅ **Success!** Account linked.", ephemeral: true });
     } catch(e) {
-        i.followUp({ content: "❌ **Auth Failed.** Try again.", ephemeral: true });
+        i.followUp({ content: "❌ **Auth Failed:** " + e.message, ephemeral: true });
     } finally {
         pendingAuth.delete(uid);
     }
