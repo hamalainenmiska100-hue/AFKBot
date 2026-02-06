@@ -1,19 +1,20 @@
 {
-  "name": "titan-afk-bot",
-  "version": "3.0.0",
-  "description": "High-performance, memory-optimized AFK bot using Bedrock Protocol",
+  "name": "discord-minecraft-bot",
+  "version": "1.0.0",
+  "description": "A Discord bot to manage AFK sessions for both Minecraft Bedrock and Java Edition.",
   "main": "bot.js",
-  "engines": {
-    "node": ">=20.0.0"
-  },
-  "dependencies": {
-    "discord.js": "^14.15.3",
-    "bedrock-protocol": "latest",
-    "prismarine-auth": "^2.4.0"
-  },
   "scripts": {
     "start": "node bot.js"
+  },
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "bedrock-protocol": "^3.34.1",
+    "discord.js": "^14.15.2",
+    "mineflayer": "^4.20.1",
+    "prismarine-auth": "^2.3.0"
+  },
+  "engines": {
+    "node": ">=16.9.0"
   }
 }
-
-
