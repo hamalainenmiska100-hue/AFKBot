@@ -106,11 +106,10 @@ function destroySession(uid, profileId = 'default') {
 
     sessions.delete(key);
 
-    // Clean up advanced logic loops
-    if (s.physicsLoop) clearInterval(s.physicsLoop);
+    // Clean up timers
+    if (s.afkLoop) clearInterval(s.afkLoop);
     if (s.moveTimer) clearTimeout(s.moveTimer);
     if (s.reconnectTimer) clearTimeout(s.reconnectTimer);
-    if (s.afkInterval) clearInterval(s.afkInterval);
     if (s.uptimeInterval) clearInterval(s.uptimeInterval);
 
     try {
@@ -133,24 +132,6 @@ function unlinkProfile(uid, profileId) {
     try {
         if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
     } catch (e) { console.error("Delete error:", e); }
-}
-
-// ----------------- MOVEMENT LOGIC (HIDDEN) -----------------
-
-// Linear interpolation
-const lerp = (start, end, amt) => (1 - amt) * start + amt * end;
-
-// Calculate Rotation
-function getLookRotation(currentPos, targetPos) {
-    const dx = targetPos.x - currentPos.x;
-    const dz = targetPos.z - currentPos.z;
-    const dy = targetPos.y - currentPos.y; 
-
-    const distance = Math.sqrt(dx * dx + dz * dz);
-    let yaw = Math.atan2(dz, dx) * (180 / Math.PI) - 90;
-    let pitch = -Math.atan2(dy, distance) * (180 / Math.PI);
-
-    return { yaw, pitch };
 }
 
 // ----------------- BEDROCK ENGINE -----------------
@@ -236,11 +217,10 @@ function createBedrockInstance(uid, profileId, opts, interaction, attempt = 0) {
         opts: opts,
         // Movement State
         pos: { x: 0, y: 0, z: 0 }, 
-        targetPos: null,           
         yaw: 0,
         pitch: 0,
-        headYaw: 0,
         tickCount: 0n,
+        congratsHours: 0,
         
         profileId: profileId,
         rejoinAttempts: attempt
@@ -249,14 +229,13 @@ function createBedrockInstance(uid, profileId, opts, interaction, attempt = 0) {
 
     botClient.on('spawn', () => {
         session.connected = true;
-        session.rejoinAttempts = 0;
+        session.rejoinAttempts = 0; // Reset attempts on success!
         console.log(`[BEDROCK] ${sessionKey} spawned`);
         if (interaction) interaction.followUp({ content: `✅ **Connected to ${opts.host}!**`, ephemeral: true });
         
         notifyUser(uid, `🚀 **Bot Connected!**\nProfile: ${profileId === 'default' ? 'Main' : 'Alt'}\nTarget: ${opts.host}`);
         
-        // Start advanced logic
-        startAdvancedLogic(uid, session);
+        startAfkLogic(uid, session);
     });
 
     botClient.on('error', (err) => console.log(`[ERR] ${sessionKey}:`, err.message));
@@ -272,137 +251,116 @@ function createBedrockInstance(uid, profileId, opts, interaction, attempt = 0) {
     botClient.on('move_player', (packet) => {
         if (packet.runtime_id === botClient.entityId) {
             session.pos = { x: packet.position.x, y: packet.position.y, z: packet.position.z };
-            session.targetPos = null; // Reset path on teleport
         }
     });
 }
 
-// ----------------- ADVANCED LOGIC (MOVEMENT & AFK) -----------------
+// ----------------- IMPROVED ANTI-AFK LOGIC -----------------
 
-function startAdvancedLogic(uid, session) {
-    // 1. Move Scheduler (Randomized ~3 mins)
-    const scheduleNextMove = () => {
-        if (!sessions.get(getSessionKey(uid, session.profileId))) return;
-        // 160s - 200s delay
-        const delay = Math.floor(Math.random() * (200000 - 160000 + 1) + 160000);
-        
-        session.moveTimer = setTimeout(() => {
-            triggerMovement(session);
-            scheduleNextMove();
-        }, delay);
-    };
-
-    // 2. Trigger
-    const triggerMovement = (s) => {
-        const angle = Math.random() * Math.PI * 2;
-        const dist = 2 + Math.random() * 2; // 2-4 blocks
-        s.targetPos = {
-            x: s.pos.x + Math.cos(angle) * dist,
-            y: s.pos.y, 
-            z: s.pos.z + Math.sin(angle) * dist
-        };
-    };
-
-    // 3. Tick Loop (50ms)
-    session.physicsLoop = setInterval(() => {
+function startAfkLogic(uid, session) {
+    // 1. Packet Loop (Keep-Alive & Head Rotation)
+    // Sends packets regularly to keep connection alive and simulate "looking around"
+    session.afkLoop = setInterval(() => {
         if (!session.client) return;
         
         try {
-            s = session;
-            s.tickCount++;
+            session.tickCount++;
 
-            let delta = { x: 0, y: 0, z: 0 };
-            let moveVector = { x: 0, z: 0 };
-            let isMoving = false;
-
-            if (s.targetPos) {
-                isMoving = true;
-                const speed = 0.22; 
-
-                const dx = s.targetPos.x - s.pos.x;
-                const dz = s.targetPos.z - s.pos.z;
-                const dist = Math.sqrt(dx*dx + dz*dz);
-
-                if (dist < 0.3) {
-                    s.targetPos = null;
-                } else {
-                    const rotations = getLookRotation(s.pos, s.targetPos);
-                    s.yaw = lerp(s.yaw, rotations.yaw, 0.15); 
-                    s.headYaw = s.yaw;
-
-                    const moveX = (dx / dist) * speed;
-                    const moveZ = (dz / dist) * speed;
-
-                    s.pos.x += moveX;
-                    s.pos.z += moveZ;
-
-                    delta = { x: moveX, y: 0, z: moveZ };
-                    moveVector = { x: dx/dist, z: dz/dist };
-                }
-            } else {
-                // Micro-Jitter
-                if (Math.random() > 0.95) {
-                    s.headYaw += (Math.random() - 0.5) * 2;
-                    s.pitch += (Math.random() - 0.5) * 1;
-                    s.pitch = Math.max(-90, Math.min(90, s.pitch));
-                }
+            // Randomly look around slightly (Simulate human idle)
+            if (Math.random() > 0.9) {
+                session.yaw += (Math.random() - 0.5) * 5;
+                session.pitch += (Math.random() - 0.5) * 2;
+                // Clamp limits
+                session.pitch = Math.max(-90, Math.min(90, session.pitch));
             }
 
-            const inputFlags = isMoving ? { _value: 3n } : { _value: 0n };
-
-            s.client.write("player_auth_input", {
-                pitch: s.pitch,
-                yaw: s.yaw,
-                position: { x: s.pos.x, y: s.pos.y, z: s.pos.z },
-                move_vector: moveVector,
-                head_yaw: s.headYaw,
-                input_data: inputFlags,
+            session.client.write("player_auth_input", {
+                pitch: session.pitch,
+                yaw: session.yaw,
+                position: { x: session.pos.x, y: session.pos.y, z: session.pos.z },
+                move_vector: { x: 0, z: 0 },
+                head_yaw: session.yaw,
+                input_data: { _value: 0n },
                 input_mode: 'mouse',
                 play_mode: 'normal',
-                tick: s.tickCount,
-                delta: delta
+                tick: session.tickCount,
+                delta: { x: 0, y: 0, z: 0 }
             });
 
         } catch (e) {}
-    }, 50);
+    }, 100); // 100ms = 10 ticks/sec
 
-    // 4. Hourly Congrats
+    // 2. Teleport Movement (0.5 blocks)
+    // Moves slightly every random interval to prevent server AFK detection
+    const scheduleTeleport = () => {
+        if (!sessions.get(getSessionKey(uid, session.profileId))) return;
+
+        // Random interval: 2 to 4 minutes
+        const delay = Math.floor(Math.random() * (240000 - 120000 + 1) + 120000);
+        
+        session.moveTimer = setTimeout(() => {
+            if (session.client) {
+                // Teleport 0.5 blocks in a random X/Z direction
+                const offset = 0.5;
+                const angle = Math.random() * Math.PI * 2;
+                
+                session.pos.x += Math.cos(angle) * offset;
+                session.pos.z += Math.sin(angle) * offset;
+                
+                // Note: The position updates in the next 'player_auth_input' packet in the loop above
+            }
+            scheduleTeleport();
+        }, delay);
+    };
+
+    scheduleTeleport();
+
+    // 3. Hourly Stats
     session.uptimeInterval = setInterval(async () => {
         session.congratsHours++;
         notifyUser(uid, `🎉 **Status Update:** Bot has been online for **${session.congratsHours} hours**!`);
     }, 3600 * 1000);
-
-    scheduleNextMove(); 
 }
 
-// ----------------- SMART REJOIN LOGIC -----------------
+// ----------------- REJOIN LOGIC (UPDATED) -----------------
 
 function handleDisconnect(uid, session) {
     const key = getSessionKey(uid, session.profileId);
     if (!sessions.has(key)) return;
 
     // Cleanup timers
-    if (session.physicsLoop) clearInterval(session.physicsLoop);
+    if (session.afkLoop) clearInterval(session.afkLoop);
     if (session.moveTimer) clearTimeout(session.moveTimer);
     if (session.reconnectTimer) clearTimeout(session.reconnectTimer);
-    if (session.afkInterval) clearInterval(session.afkInterval);
     if (session.uptimeInterval) clearInterval(session.uptimeInterval);
 
     if (session.manualStop) {
         notifyUser(uid, `⏹ **Bot Stopped.**\nYou manually terminated the session.`);
         destroySession(uid, session.profileId);
     } else {
-        // Backoff: 10s -> 30s -> 60s -> 5min
-        let waitTime = 10000;
-        if (session.rejoinAttempts === 1) waitTime = 30000;
-        else if (session.rejoinAttempts >= 2 && session.rejoinAttempts < 5) waitTime = 60000;
-        else if (session.rejoinAttempts >= 5) waitTime = 300000;
+        // --- NEW REJOIN STRATEGY ---
+        // Max 5 attempts
+        if (session.rejoinAttempts >= 5) {
+            notifyUser(uid, `❌ **Reconnection Failed:** Gave up after 5 attempts.`);
+            destroySession(uid, session.profileId);
+            return;
+        }
 
-        notifyUser(uid, `⚠️ **Disconnected!**\nAuto-rejoining in ${waitTime / 1000} seconds... (Attempt ${session.rejoinAttempts + 1})`);
+        // 0 attempts (First kick) -> 0ms delay (Immediate)
+        // 1+ attempts -> 30s delay
+        let waitTime = (session.rejoinAttempts === 0) ? 0 : 30000;
+
+        // Message logic
+        if (waitTime === 0) {
+            notifyUser(uid, `⚠️ **Disconnected!** Rejoining immediately... (Attempt ${session.rejoinAttempts + 1}/5)`);
+        } else {
+            notifyUser(uid, `⚠️ **Disconnected!** Waiting 30s before retry... (Attempt ${session.rejoinAttempts + 1}/5)`);
+        }
         
         session.reconnectTimer = setTimeout(() => {
             if (sessions.has(key) && !sessions.get(key).manualStop) {
                 try { session.client.removeAllListeners(); session.client.close(); } catch(e){}
+                // Pass attempt count + 1
                 createBedrockInstance(uid, session.profileId, session.opts, null, session.rejoinAttempts + 1);
             } else {
                 destroySession(uid, session.profileId);
@@ -516,7 +474,6 @@ client.on(Events.InteractionCreate, async (i) => {
                 u.bedrockVersion = i.values[0];
                 saveDatabase();
                 
-                // Get profileId from the existing button logic or default
                 let profileId = 'default';
                 try {
                     const oldId = i.message.components[1].components[0].customId;
@@ -533,7 +490,6 @@ client.on(Events.InteractionCreate, async (i) => {
 
             if (i.customId === "start_select") {
                 const u = getUser(uid);
-                // Updating the ephemeral menu to the preflight check
                 return showPreFlight(i, u, i.values[0], true);
             }
 
@@ -560,7 +516,6 @@ client.on(Events.InteractionCreate, async (i) => {
             u.server = { ip: i.fields.getTextInputValue("ip"), port: parseInt(i.fields.getTextInputValue("port")) };
             u.offlineUsername = i.fields.getTextInputValue("off");
             saveDatabase();
-            // Response to modal submit is private
             return i.reply({ content: "✅ Settings saved.", ephemeral: true });
         }
 
@@ -578,7 +533,6 @@ function showPreFlight(i, u, profileId, isUpdate) {
     const pName = u.profiles.find(p => p.id === profileId)?.name || "Default";
     const content = `**Pre-Flight Check**\nAccount: **${pName}**\nTarget: \`${u.server.ip}:${u.server.port}\`\n\n*Ready to join?*`;
     
-    // Crucial: Use update if modifying existing ephemeral message, reply if creating new one
     if (isUpdate) return i.update({ content: content, components: [verRow, confirmRow] });
     return i.reply({ content: content, components: [verRow, confirmRow], ephemeral: true });
 }
@@ -587,7 +541,6 @@ async function handleLink(uid, interaction) {
     if (pendingAuth.has(uid)) return interaction.reply({ content: "⏳ Auth pending.", ephemeral: true });
     const u = getUser(uid);
     
-    // RESTRICTION: Normal user limit
     if (uid !== ROOT_ID && u.profiles.length >= 1) {
         return interaction.reply({ content: "❌ **You cant link more than one Xbox account!**\nUnlink your current one first.", ephemeral: true });
     }
@@ -598,7 +551,6 @@ async function handleLink(uid, interaction) {
     const flow = new Authflow(uid, newAuthDir, { flow: "live", authTitle: Titles.MinecraftNintendoSwitch, deviceType: "Nintendo" }, async (res) => {
         const link = res.verification_uri_complete || res.verification_uri;
         const row = new ActionRowBuilder().addComponents(new ButtonBuilder().setLabel("Login to Microsoft").setStyle(ButtonStyle.Link).setURL(link));
-        // Link request is always private
         interaction.editReply({ content: `🔐 **Code:** \`${res.user_code}\`\n*Link new account...*`, components: [row] }).catch(()=>{});
     });
 
