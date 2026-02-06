@@ -106,7 +106,7 @@ function destroySession(uid, profileId = 'default') {
 
     sessions.delete(key);
 
-    // Clean up timers (Added actionLoop)
+    // Clean up timers
     if (s.afkLoop) clearInterval(s.afkLoop);
     if (s.actionLoop) clearInterval(s.actionLoop);
     if (s.moveTimer) clearTimeout(s.moveTimer);
@@ -173,22 +173,32 @@ async function prepareStart(uid, interaction, profileId, isUpdate = false) {
     if (isUpdate) await interaction.update({ content: `🔎 **Pinging ${ip}:${port}...**`, components: [], embeds: [] });
     else await interaction.reply({ content: `🔎 **Pinging ${ip}:${port}...**`, components: [], embeds: [], ephemeral: true });
 
+    let detectedVersion = null;
+
     try {
-        await bedrock.ping({ host: ip, port: port, timeout: 5000 });
-        await interaction.editReply({ content: `✅ **Server Found! Joining as ${profile.name}...**` });
+        // Ping to check server status AND grab version
+        const pong = await bedrock.ping({ host: ip, port: port, timeout: 5000 });
+        detectedVersion = pong.version; // Capture the real version
+        await interaction.editReply({ content: `✅ **Server Found! (v${detectedVersion}) Joining as ${profile.name}...**` });
     } catch (e) {
         return interaction.editReply({ content: `❌ **Connection Failed:** Server offline.\nReason: ${e.message}` });
     }
+
+    // Determine Version Strategy
+    // If set to auto, use the one we JUST detected. If manual, use user setting.
+    const targetVersion = u.bedrockVersion === "auto" ? detectedVersion : u.bedrockVersion;
 
     const options = {
         host: ip,
         port: port,
         connectTimeout: 30000,
-        skipPing: false, 
-        version: u.bedrockVersion === "auto" ? undefined : u.bedrockVersion,
+        skipPing: false, // Standard handshake
+        version: targetVersion, // EXPLICIT VERSION prevents auto-detect hang
         offline: u.connectionType === "offline",
         username: u.connectionType === "offline" ? (u.offlineUsername || `AFK_${uid.slice(-4)}`) : uid,
-        profilesFolder: u.connectionType === "online" ? authDir : undefined
+        profilesFolder: u.connectionType === "online" ? authDir : undefined,
+        // Logging for VPS debug
+        onMsaCode: (code) => console.log(`[MSA] Code for ${uid}:`, code) 
     };
 
     if (u.connectionType === "online") {
@@ -196,20 +206,23 @@ async function prepareStart(uid, interaction, profileId, isUpdate = false) {
         if (!hasProfile) return interaction.followUp({ content: "❌ Account not linked!", ephemeral: true });
     }
 
+    console.log(`[INIT] Starting bot for ${uid} on ${ip}:${port} (v${targetVersion})`);
     createBedrockInstance(uid, profile.id, options, interaction);
 }
 
 function createBedrockInstance(uid, profileId, opts, interaction, attempt = 0) {
+    const sessionKey = getSessionKey(uid, profileId);
     let botClient;
+
     try {
+        // Force synchronous error catching
         botClient = bedrock.createClient(opts);
     } catch (e) {
+        console.error(`[CRASH] Init failed for ${sessionKey}:`, e);
         if (interaction) interaction.followUp({ content: `❌ Init Error: ${e.message}`, ephemeral: true });
         return;
     }
 
-    const sessionKey = getSessionKey(uid, profileId);
-    
     const session = {
         client: botClient,
         connected: false,
@@ -221,7 +234,7 @@ function createBedrockInstance(uid, profileId, opts, interaction, attempt = 0) {
         yaw: 0,
         pitch: 0,
         tickCount: 0n,
-        runtimeEntityId: null, // Critical for animations
+        runtimeEntityId: null, 
         congratsHours: 0,
         
         profileId: profileId,
@@ -229,15 +242,22 @@ function createBedrockInstance(uid, profileId, opts, interaction, attempt = 0) {
     };
     sessions.set(sessionKey, session);
 
-    // Capture Entity ID for animations
+    // --- CRITICAL EVENTS ---
+
+    botClient.on('join', () => {
+        console.log(`[BEDROCK] ${sessionKey} joined server (Handshake OK)`);
+    });
+
     botClient.on('start_game', (packet) => {
+        console.log(`[BEDROCK] ${sessionKey} Game Started. Runtime ID: ${packet.runtime_entity_id}`);
         session.runtimeEntityId = packet.runtime_entity_id;
+        session.pos = packet.player_position;
     });
 
     botClient.on('spawn', () => {
         session.connected = true;
         session.rejoinAttempts = 0; // Reset attempts on success!
-        console.log(`[BEDROCK] ${sessionKey} spawned`);
+        console.log(`[BEDROCK] ${sessionKey} spawned successfully.`);
         if (interaction) interaction.followUp({ content: `✅ **Connected to ${opts.host}!**`, ephemeral: true });
         
         notifyUser(uid, `🚀 **Bot Connected!**\nProfile: ${profileId === 'default' ? 'Main' : 'Alt'}\nTarget: ${opts.host}`);
@@ -245,15 +265,21 @@ function createBedrockInstance(uid, profileId, opts, interaction, attempt = 0) {
         startAfkLogic(uid, session);
     });
 
-    botClient.on('error', (err) => console.log(`[ERR] ${sessionKey}:`, err.message));
+    botClient.on('error', (err) => {
+        console.log(`[ERR] ${sessionKey} Client Error:`, err.message);
+    });
 
     botClient.on('kick', (reason) => {
+        console.log(`[KICK] ${sessionKey}:`, reason);
         botClient.removeAllListeners();
         notifyUser(uid, `⚠️ **Bot Kicked!**\nReason: \`${reason}\``);
         destroySession(uid, profileId);
     });
 
-    botClient.on('close', () => handleDisconnect(uid, session));
+    botClient.on('close', () => {
+        console.log(`[CLOSE] ${sessionKey} socket closed.`);
+        handleDisconnect(uid, session);
+    });
 
     botClient.on('move_player', (packet) => {
         if (packet.runtime_id === botClient.entityId) {
@@ -262,22 +288,18 @@ function createBedrockInstance(uid, profileId, opts, interaction, attempt = 0) {
     });
 }
 
-// ----------------- IMPROVED ANTI-AFK LOGIC (FIXED TIMEOUTS) -----------------
+// ----------------- ANTI-AFK & LOGIC -----------------
 
 function startAfkLogic(uid, session) {
     // 1. Packet Loop (Keep-Alive & Head Rotation)
-    // Sends packets regularly to keep connection alive and simulate "looking around"
     session.afkLoop = setInterval(() => {
         if (!session.client) return;
         
         try {
             session.tickCount++;
-
-            // Randomly look around slightly (Simulate human idle)
             if (Math.random() > 0.9) {
                 session.yaw += (Math.random() - 0.5) * 5;
                 session.pitch += (Math.random() - 0.5) * 2;
-                // Clamp limits
                 session.pitch = Math.max(-90, Math.min(90, session.pitch));
             }
 
@@ -293,12 +315,10 @@ function startAfkLogic(uid, session) {
                 tick: session.tickCount,
                 delta: { x: 0, y: 0, z: 0 }
             });
-
         } catch (e) {}
-    }, 100); // 100ms = 10 ticks/sec
+    }, 100); 
 
-    // 2. ACTION LOOP (NEW: Prevents "Ghost" timeouts)
-    // Punches the air every 5 seconds. This keeps the connection "hot".
+    // 2. ACTION LOOP (Prevents "Ghost" timeouts)
     session.actionLoop = setInterval(() => {
         if (!session.client || !session.runtimeEntityId) return;
         try {
@@ -310,23 +330,17 @@ function startAfkLogic(uid, session) {
     }, 5000);
 
     // 3. Teleport Movement (0.5 blocks)
-    // Moves slightly every random interval to prevent server AFK detection
     const scheduleTeleport = () => {
         if (!sessions.get(getSessionKey(uid, session.profileId))) return;
-
-        // Random interval: 30s to 90s (More frequent to prevent 1h timeouts)
+        // 30s to 90s
         const delay = Math.floor(Math.random() * (90000 - 30000 + 1) + 30000);
         
         session.moveTimer = setTimeout(() => {
             if (session.client) {
-                // Teleport 0.5 blocks in a random X/Z direction
                 const offset = 0.5;
                 const angle = Math.random() * Math.PI * 2;
-                
                 session.pos.x += Math.cos(angle) * offset;
                 session.pos.z += Math.sin(angle) * offset;
-                
-                // Note: The position updates in the next 'player_auth_input' packet in the loop above
             }
             scheduleTeleport();
         }, delay);
@@ -347,7 +361,6 @@ function handleDisconnect(uid, session) {
     const key = getSessionKey(uid, session.profileId);
     if (!sessions.has(key)) return;
 
-    // Cleanup timers
     if (session.afkLoop) clearInterval(session.afkLoop);
     if (session.actionLoop) clearInterval(session.actionLoop);
     if (session.moveTimer) clearTimeout(session.moveTimer);
@@ -358,19 +371,15 @@ function handleDisconnect(uid, session) {
         notifyUser(uid, `⏹ **Bot Stopped.**\nYou manually terminated the session.`);
         destroySession(uid, session.profileId);
     } else {
-        // --- NEW REJOIN STRATEGY ---
-        // Max 5 attempts
+        // --- REJOIN STRATEGY ---
         if (session.rejoinAttempts >= 5) {
             notifyUser(uid, `❌ **Reconnection Failed:** Gave up after 5 attempts.`);
             destroySession(uid, session.profileId);
             return;
         }
 
-        // 0 attempts (First kick) -> 0ms delay (Immediate)
-        // 1+ attempts -> 30s delay
         let waitTime = (session.rejoinAttempts === 0) ? 0 : 30000;
 
-        // Message logic
         if (waitTime === 0) {
             notifyUser(uid, `⚠️ **Disconnected!** Rejoining immediately... (Attempt ${session.rejoinAttempts + 1}/5)`);
         } else {
@@ -380,7 +389,6 @@ function handleDisconnect(uid, session) {
         session.reconnectTimer = setTimeout(() => {
             if (sessions.has(key) && !sessions.get(key).manualStop) {
                 try { session.client.removeAllListeners(); session.client.close(); } catch(e){}
-                // Pass attempt count + 1
                 createBedrockInstance(uid, session.profileId, session.opts, null, session.rejoinAttempts + 1);
             } else {
                 destroySession(uid, session.profileId);
@@ -397,19 +405,16 @@ client.on(Events.InteractionCreate, async (i) => {
 
     try {
         if (i.isChatInputCommand() && i.commandName === "panel") {
-            // Public Panel (Not ephemeral)
             return i.reply({ content: "**Bedrock Bot Panel 🤖**", components: getPanel() });
         }
 
         if (i.isButton()) {
             const id = i.customId;
 
-            // --- START FLOW ---
             if (id === "pre_bedrock") {
                 const u = getUser(uid);
                 if (!u.server) return i.reply({ content: "❌ **Configuration Missing!** Go to Settings.", ephemeral: true });
 
-                // VIP Multi-Account Select
                 if (uid === ROOT_ID && u.profiles.length > 1) {
                     const select = new StringSelectMenuBuilder()
                         .setCustomId("start_select")
@@ -419,23 +424,19 @@ client.on(Events.InteractionCreate, async (i) => {
                     return i.reply({ content: "Choose an account:", components: [new ActionRowBuilder().addComponents(select)], ephemeral: true });
                 }
 
-                // Default Flow
                 const profileId = u.profiles.length > 0 ? u.profiles[0].id : 'default';
-                return showPreFlight(i, u, profileId, false); // false = reply new message
+                return showPreFlight(i, u, profileId, false);
             }
 
             if (id.startsWith("start_conf_")) {
                 const profileId = id.replace("start_conf_", "");
-                // This happens inside ephemeral message, so we update it
                 return prepareStart(uid, i, profileId, true);
             }
             
             if (id === "cancel") return i.update({ content: "❌ Cancelled.", components: [], embeds: [] });
 
-            // --- STOP FLOW ---
             if (id === "stop_bedrock") {
                 const userSessions = Array.from(sessions.entries()).filter(([k, v]) => k.startsWith(uid + "_"));
-                
                 if (userSessions.length === 0) return i.reply({ content: "❌ No bots running.", ephemeral: true });
 
                 if (userSessions.length === 1) {
@@ -456,7 +457,6 @@ client.on(Events.InteractionCreate, async (i) => {
                 }
             }
 
-            // --- SETTINGS ---
             if (id === "set_bedrock") {
                 const u = getUser(uid);
                 const m = new ModalBuilder().setCustomId("modal_bedrock").setTitle("Bedrock Settings");
@@ -467,7 +467,6 @@ client.on(Events.InteractionCreate, async (i) => {
                 return i.showModal(m);
             }
 
-            // --- LINKING ---
             if (id === "link") return handleLink(uid, i);
             
             if (id === "unlink") {
@@ -487,7 +486,6 @@ client.on(Events.InteractionCreate, async (i) => {
             }
         }
 
-        // --- MENUS ---
         if (i.isStringSelectMenu()) {
             if (i.customId === "sel_bed_ver") {
                 const u = getUser(uid);
