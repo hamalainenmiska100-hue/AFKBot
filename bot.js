@@ -92,6 +92,20 @@ async function notifyUser(uid, message) {
     } catch (e) {}
 }
 
+// ----------------- VERSION RESOLVER (CRITICAL FIX) -----------------
+// Maps unsupported new minor versions to known stable protocol versions
+function resolveSafeVersion(detectedVer) {
+    if (!detectedVer) return undefined;
+    
+    // Fix for 1.21.132 -> 1.21.130 (Protocol 766 compatibility)
+    if (detectedVer.includes("1.21.13")) return "1.21.130";
+    if (detectedVer.includes("1.21.12")) return "1.21.124";
+    
+    // Fallback: If version is totally unknown, try to force 1.21.130 as it's most common right now
+    // or return the original if it looks like a main version.
+    return detectedVer;
+}
+
 // ----------------- SESSION MANAGEMENT -----------------
 
 function getSessionKey(uid, profileId) {
@@ -103,6 +117,10 @@ function destroySession(uid, profileId = 'default') {
     const s = sessions.get(key);
     
     if (!s) return;
+    
+    // Prevent double-destroy spam
+    if (s.isDestroying) return;
+    s.isDestroying = true;
 
     sessions.delete(key);
 
@@ -115,7 +133,7 @@ function destroySession(uid, profileId = 'default') {
 
     try {
         if (s.client) {
-            s.client.removeAllListeners();
+            s.client.removeAllListeners(); // STOP EVENT LOOP
             s.client.close();
         }
     } catch (e) {
@@ -176,29 +194,31 @@ async function prepareStart(uid, interaction, profileId, isUpdate = false) {
     let detectedVersion = null;
 
     try {
-        // Ping to check server status AND grab version
         const pong = await bedrock.ping({ host: ip, port: port, timeout: 5000 });
-        detectedVersion = pong.version; // Capture the real version
-        await interaction.editReply({ content: `✅ **Server Found! (v${detectedVersion}) Joining as ${profile.name}...**` });
+        detectedVersion = pong.version;
+        // Logic to fix "Unsupported version" error
+        const safeVersion = resolveSafeVersion(detectedVersion);
+        
+        await interaction.editReply({ content: `✅ **Server Found! (v${detectedVersion} -> using v${safeVersion}) Joining as ${profile.name}...**` });
+        
+        // Use the safe version for connection
+        detectedVersion = safeVersion; 
     } catch (e) {
         return interaction.editReply({ content: `❌ **Connection Failed:** Server offline.\nReason: ${e.message}` });
     }
 
     // Determine Version Strategy
-    // If set to auto, use the one we JUST detected. If manual, use user setting.
     const targetVersion = u.bedrockVersion === "auto" ? detectedVersion : u.bedrockVersion;
 
     const options = {
         host: ip,
         port: port,
         connectTimeout: 30000,
-        skipPing: false, // Standard handshake
-        version: targetVersion, // EXPLICIT VERSION prevents auto-detect hang
+        skipPing: false, 
+        version: targetVersion, 
         offline: u.connectionType === "offline",
         username: u.connectionType === "offline" ? (u.offlineUsername || `AFK_${uid.slice(-4)}`) : uid,
-        profilesFolder: u.connectionType === "online" ? authDir : undefined,
-        // Logging for VPS debug
-        onMsaCode: (code) => console.log(`[MSA] Code for ${uid}:`, code) 
+        profilesFolder: u.connectionType === "online" ? authDir : undefined
     };
 
     if (u.connectionType === "online") {
@@ -206,7 +226,7 @@ async function prepareStart(uid, interaction, profileId, isUpdate = false) {
         if (!hasProfile) return interaction.followUp({ content: "❌ Account not linked!", ephemeral: true });
     }
 
-    console.log(`[INIT] Starting bot for ${uid} on ${ip}:${port} (v${targetVersion})`);
+    console.log(`[INIT] Starting bot for ${uid} on ${ip}:${port} (Target: v${targetVersion})`);
     createBedrockInstance(uid, profile.id, options, interaction);
 }
 
@@ -215,7 +235,6 @@ function createBedrockInstance(uid, profileId, opts, interaction, attempt = 0) {
     let botClient;
 
     try {
-        // Force synchronous error catching
         botClient = bedrock.createClient(opts);
     } catch (e) {
         console.error(`[CRASH] Init failed for ${sessionKey}:`, e);
@@ -236,27 +255,27 @@ function createBedrockInstance(uid, profileId, opts, interaction, attempt = 0) {
         tickCount: 0n,
         runtimeEntityId: null, 
         congratsHours: 0,
+        isDestroying: false, // Flag to prevent spam loop
         
         profileId: profileId,
         rejoinAttempts: attempt
     };
     sessions.set(sessionKey, session);
 
-    // --- CRITICAL EVENTS ---
+    // --- EVENTS ---
 
     botClient.on('join', () => {
         console.log(`[BEDROCK] ${sessionKey} joined server (Handshake OK)`);
     });
 
     botClient.on('start_game', (packet) => {
-        console.log(`[BEDROCK] ${sessionKey} Game Started. Runtime ID: ${packet.runtime_entity_id}`);
         session.runtimeEntityId = packet.runtime_entity_id;
         session.pos = packet.player_position;
     });
 
     botClient.on('spawn', () => {
         session.connected = true;
-        session.rejoinAttempts = 0; // Reset attempts on success!
+        session.rejoinAttempts = 0; 
         console.log(`[BEDROCK] ${sessionKey} spawned successfully.`);
         if (interaction) interaction.followUp({ content: `✅ **Connected to ${opts.host}!**`, ephemeral: true });
         
@@ -288,13 +307,11 @@ function createBedrockInstance(uid, profileId, opts, interaction, attempt = 0) {
     });
 }
 
-// ----------------- ANTI-AFK & LOGIC -----------------
+// ----------------- ANTI-AFK -----------------
 
 function startAfkLogic(uid, session) {
-    // 1. Packet Loop (Keep-Alive & Head Rotation)
     session.afkLoop = setInterval(() => {
         if (!session.client) return;
-        
         try {
             session.tickCount++;
             if (Math.random() > 0.9) {
@@ -318,7 +335,6 @@ function startAfkLogic(uid, session) {
         } catch (e) {}
     }, 100); 
 
-    // 2. ACTION LOOP (Prevents "Ghost" timeouts)
     session.actionLoop = setInterval(() => {
         if (!session.client || !session.runtimeEntityId) return;
         try {
@@ -329,10 +345,8 @@ function startAfkLogic(uid, session) {
         } catch (e) {}
     }, 5000);
 
-    // 3. Teleport Movement (0.5 blocks)
     const scheduleTeleport = () => {
         if (!sessions.get(getSessionKey(uid, session.profileId))) return;
-        // 30s to 90s
         const delay = Math.floor(Math.random() * (90000 - 30000 + 1) + 30000);
         
         session.moveTimer = setTimeout(() => {
@@ -348,23 +362,21 @@ function startAfkLogic(uid, session) {
 
     scheduleTeleport();
 
-    // 4. Hourly Stats
     session.uptimeInterval = setInterval(async () => {
         session.congratsHours++;
         notifyUser(uid, `🎉 **Status Update:** Bot has been online for **${session.congratsHours} hours**!`);
     }, 3600 * 1000);
 }
 
-// ----------------- REJOIN LOGIC (UPDATED) -----------------
+// ----------------- REJOIN LOGIC (ANTI-SPAM) -----------------
 
 function handleDisconnect(uid, session) {
     const key = getSessionKey(uid, session.profileId);
-    if (!sessions.has(key)) return;
+    if (!sessions.has(key)) return; // Already destroyed
 
+    // Stop loops immediately
     if (session.afkLoop) clearInterval(session.afkLoop);
     if (session.actionLoop) clearInterval(session.actionLoop);
-    if (session.moveTimer) clearTimeout(session.moveTimer);
-    if (session.reconnectTimer) clearTimeout(session.reconnectTimer);
     if (session.uptimeInterval) clearInterval(session.uptimeInterval);
 
     if (session.manualStop) {
@@ -389,6 +401,7 @@ function handleDisconnect(uid, session) {
         session.reconnectTimer = setTimeout(() => {
             if (sessions.has(key) && !sessions.get(key).manualStop) {
                 try { session.client.removeAllListeners(); session.client.close(); } catch(e){}
+                // Pass attempt count + 1 AND use opts with SAFE version
                 createBedrockInstance(uid, session.profileId, session.opts, null, session.rejoinAttempts + 1);
             } else {
                 destroySession(uid, session.profileId);
