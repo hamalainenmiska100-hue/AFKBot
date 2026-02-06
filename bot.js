@@ -14,7 +14,7 @@ const {
 } = require("discord.js");
 
 const bedrock = require("bedrock-protocol");
-const mineflayer = require("mineflayer"); // Added for Java support
+const mineflayer = require("mineflayer");
 const { Authflow, Titles } = require("prismarine-auth");
 const fs = require("fs");
 const path = require("path");
@@ -59,16 +59,9 @@ function getUser(uid) {
   if (!users[uid].connectionType) users[uid].connectionType = "online";
   if (!users[uid].bedrockVersion || users[uid].bedrockVersion === "auto") users[uid].bedrockVersion = "1.21.60";
   if (!users[uid].offlineUsername) users[uid].offlineUsername = `AFK_${uid.slice(-4)}`;
-  if (!users[uid].profiles) {
-      if (users[uid].linked) {
-          users[uid].profiles = [{ id: 'default', name: 'Main Account', created: Date.now() }];
-      } else {
-          users[uid].profiles = [];
-      }
-      delete users[uid].linked;
-  }
+  if (!users[uid].profiles) users[uid].profiles = [];
   
-  // Java Defaults (NEW)
+  // Java Defaults
   if (!users[uid].java) {
     users[uid].java = {
       server: null,
@@ -87,8 +80,8 @@ function getUserAuthDir(uid, profileId) {
 }
 
 // ----------------- GLOBAL STATE -----------------
-const sessions = new Map();     // Bedrock Sessions
-const javaSessions = new Map(); // Java Sessions
+const sessions = new Map();
+const javaSessions = new Map();
 const pendingAuth = new Map();
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.DirectMessages] });
@@ -102,7 +95,6 @@ async function notifyUser(uid, message) {
 }
 
 // ----------------- UNIFIED SESSION MANAGEMENT -----------------
-
 function getSessionKey(uid, profileId) {
     return `${uid}_${profileId || 'default'}`;
 }
@@ -116,7 +108,6 @@ function destroySession(uid, type, profileId = 'default') {
     if (!s || s.isDestroying) return;
     s.isDestroying = true;
 
-    // Clear All Timers
     if (s.afkLoop) clearInterval(s.afkLoop);
     if (s.actionLoop) clearInterval(s.actionLoop);
     if (s.moveTimer) clearTimeout(s.moveTimer);
@@ -125,7 +116,7 @@ function destroySession(uid, type, profileId = 'default') {
 
     try {
         if (isJava && s.bot) {
-            s.bot.quit();
+            s.bot.end(); // FIX: Changed from .quit() to .end()
             s.bot.removeAllListeners();
         } else if (!isJava && s.client) {
             s.client.removeAllListeners();
@@ -139,18 +130,7 @@ function destroySession(uid, type, profileId = 'default') {
     console.log(`[${type.toUpperCase()}] Session destroyed: ${key}`);
 }
 
-function unlinkProfile(uid, profileId) {
-    const u = getUser(uid);
-    u.profiles = u.profiles.filter(p => p.id !== profileId);
-    saveDatabase();
-    const dir = getUserAuthDir(uid, profileId);
-    try {
-        if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
-    } catch (e) { console.error("Delete error:", e); }
-}
-
 // ----------------- BEDROCK ENGINE -----------------
-
 async function prepareBedrockStart(uid, interaction, profileId, isUpdate = false) {
     const u = getUser(uid);
     const profile = u.profiles.find(p => p.id === profileId) || { id: 'default', name: 'Offline/Default' };
@@ -163,11 +143,6 @@ async function prepareBedrockStart(uid, interaction, profileId, isUpdate = false
     const key = getSessionKey(uid, profile.id);
     if (sessions.has(key)) {
         const msg = `❌ **Session Active:** This profile (${profile.name}) is already online. Stop it first.`;
-        return isUpdate ? interaction.update({ content: msg, components: [] }) : interaction.reply({ content: msg, ephemeral: true });
-    }
-
-    if (uid !== ROOT_ID && Array.from(sessions.keys()).some(k => k.startsWith(uid))) {
-        const msg = "❌ **Limit Reached:** You can only have one active Bedrock bot.";
         return isUpdate ? interaction.update({ content: msg, components: [] }) : interaction.reply({ content: msg, ephemeral: true });
     }
 
@@ -185,31 +160,20 @@ async function prepareBedrockStart(uid, interaction, profileId, isUpdate = false
     }
 
     const options = {
-        host: ip,
-        port: port,
-        connectTimeout: 30000,
-        skipPing: true,
-        version: u.bedrockVersion, 
-        offline: u.connectionType === "offline",
+        host: ip, port: port, connectTimeout: 30000, skipPing: true,
+        version: u.bedrockVersion, offline: u.connectionType === "offline",
         username: u.connectionType === "offline" ? (u.offlineUsername || `AFK_${uid.slice(-4)}`) : undefined,
         profilesFolder: u.connectionType === "online" ? authDir : undefined,
-        authTitle: Titles.MinecraftNintendoSwitch,
-        flow: 'live',
-        skinData: { DeviceId: crypto.randomUUID(), SelfSignedId: crypto.randomUUID() } // Simplified but effective
+        authTitle: Titles.MinecraftNintendoSwitch, flow: 'live'
     };
 
-    if (u.connectionType === "online" && !u.profiles.find(p => p.id === profile.id)) {
-        return interaction.followUp({ content: "❌ Account not linked!", ephemeral: true });
-    }
-
-    console.log(`[INIT] Starting Bedrock bot for ${uid} on ${ip}:${port} (v${u.bedrockVersion})`);
+    console.log(`[INIT] Starting Bedrock bot for ${uid} on ${ip}:${port}`);
     createBedrockInstance(uid, profile.id, options, interaction);
 }
 
 function createBedrockInstance(uid, profileId, opts, interaction, attempt = 0) {
     const sessionKey = getSessionKey(uid, profileId);
     let botClient;
-
     try {
         botClient = bedrock.createClient(opts);
     } catch (e) {
@@ -225,55 +189,50 @@ function createBedrockInstance(uid, profileId, opts, interaction, attempt = 0) {
     };
     sessions.set(sessionKey, session);
 
-    botClient.on('resource_packs_info', (packet) => {
+    botClient.on('resource_packs_info', () => {
         botClient.write('resource_pack_client_response', { response_status: 'completed', resourcepack_ids: [] });
         botClient.write('client_cache_status', { enabled: false });
     });
-
     botClient.on('spawn', () => {
         session.connected = true;
         session.rejoinAttempts = 0; 
         console.log(`[BEDROCK] ${sessionKey} spawned successfully.`);
         if (interaction) interaction.followUp({ content: `✅ **Connected to ${opts.host}!**`, ephemeral: true });
-        notifyUser(uid, `🚀 **Bedrock Bot Connected!**\nProfile: ${profileId}\nTarget: ${opts.host}`);
-        startAfkLogic(uid, session, 'bedrock');
+        notifyUser(uid, `🚀 **Bedrock Bot Connected!**`);
+        startAfkLogic(uid, session);
     });
-
     botClient.on('error', (err) => console.log(`[ERR] ${sessionKey} Client Error:`, err.message));
     botClient.on('kick', (reason) => {
-        notifyUser(uid, `⚠️ **Bot Kicked!**\nReason: \`${JSON.stringify(reason)}\``);
+        notifyUser(uid, `⚠️ **Bot Kicked!** Reason: \`${JSON.stringify(reason)}\``);
         destroySession(uid, 'bedrock', profileId);
     });
     botClient.on('close', () => handleDisconnect(uid, session));
 }
 
-
-// ----------------- JAVA ENGINE (NEW) -----------------
-
+// ----------------- JAVA ENGINE -----------------
 async function startJava(uid, interaction) {
     const u = getUser(uid);
-    if (!u.java.server) return interaction.update({ content: "❌ No Java server set! Go to Settings in the Java panel.", components: [] });
+    if (!u.java.server) return interaction.update({ content: "❌ No Java server set! Go to Settings.", components: [] });
     if (javaSessions.has(uid)) return interaction.update({ content: "❌ Java bot is already running.", components: [] });
 
     const { ip, port } = u.java.server;
     await interaction.update({ content: `☕ **Connecting to ${ip}:${port}...**`, components: [], embeds: [] });
 
     const options = {
-        host: ip,
-        port: port,
+        host: ip, port: port,
         username: u.java.offlineUsername || `Java_${uid.slice(-4)}`,
         auth: 'offline',
         version: u.java.selectedVersion === "auto" ? false : u.java.selectedVersion,
         checkTimeoutInterval: 60 * 1000,
         hideErrors: false
     };
-
     createJavaInstance(uid, options, interaction);
 }
 
 function createJavaInstance(uid, opts, interaction, attempt = 0) {
     let bot;
     try {
+        console.log(`[INIT] Creating Java bot for ${uid} with options:`, opts);
         bot = mineflayer.createBot(opts);
     } catch (e) {
         if (interaction) interaction.followUp({ content: `❌ Init Error: ${e.message}`, ephemeral: true });
@@ -286,29 +245,35 @@ function createJavaInstance(uid, opts, interaction, attempt = 0) {
     };
     javaSessions.set(uid, session);
 
+    bot.once('login', () => console.log(`[JAVA] ${uid} has logged in.`));
     bot.once('spawn', () => {
         session.connected = true;
         session.rejoinAttempts = 0;
         console.log(`[JAVA] ${uid} spawned on ${opts.host}`);
         if (interaction) interaction.followUp({ content: `✅ **Connected to ${opts.host}!**`, ephemeral: true });
-        notifyUser(uid, `🚀 **Java Bot Connected!**\nTarget: ${opts.host}`);
-        startAfkLogic(uid, session, 'java');
+        notifyUser(uid, `🚀 **Java Bot Connected!**`);
+        startAfkLogic(uid, session);
     });
-
-    bot.on('error', (err) => console.log(`[JAVA ERR] ${uid}:`, err.message));
-    bot.on('kicked', (reason) => notifyUser(uid, `⚠️ **Java Bot Kicked:** ${reason}`));
-    bot.on('end', () => handleDisconnect(uid, session));
+    bot.on('error', (err) => {
+        console.error(`[JAVA ERR] ${uid}:`, err);
+        if (err.code === 'ECONNRESET') notifyUser(uid, "⚠️ **Connection Reset!** The server may be offline or your version is incompatible.");
+    });
+    bot.on('kicked', (reason) => {
+        console.log(`[JAVA KICK] ${uid}:`, reason);
+        notifyUser(uid, `⚠️ **Java Bot Kicked:** ${reason}`);
+    });
+    bot.on('end', (reason) => {
+        console.log(`[JAVA END] ${uid} disconnected. Reason: ${reason}`);
+        handleDisconnect(uid, session);
+    });
 }
 
 // ----------------- UNIFIED ANTI-AFK & RECONNECT -----------------
-
-function startAfkLogic(uid, session, type) {
+function startAfkLogic(uid, session) {
+    const type = session.type;
     if (type === 'bedrock') {
         session.afkLoop = setInterval(() => {
-            if (!session.client) return;
-            try {
-                session.client.write("player_auth_input", { pitch: session.pitch, yaw: session.yaw, position: session.pos, move_vector: { x: 0, z: 0 }, head_yaw: session.yaw, input_data: { _value: 0n }, input_mode: 'mouse', play_mode: 'normal', tick: session.tickCount++, delta: { x: 0, y: 0, z: 0 }});
-            } catch (e) {}
+            if (session.client) session.client.write("player_auth_input", { pitch: session.pitch, yaw: session.yaw, position: session.pos, move_vector: { x: 0, z: 0 }, head_yaw: session.yaw, input_data: { _value: 0n }, input_mode: 'mouse', play_mode: 'normal', tick: session.tickCount++, delta: { x: 0, y: 0, z: 0 }});
         }, 100);
         session.actionLoop = setInterval(() => {
              if (session.client) session.client.write("animate", { action_id: 1, runtime_entity_id: session.runtimeEntityId });
@@ -317,7 +282,8 @@ function startAfkLogic(uid, session, type) {
         session.afkLoop = setInterval(() => {
             if (session.bot?.entity) {
                 session.bot.swingArm();
-                session.bot.setControlState('jump', Math.random() > 0.8);
+                if (Math.random() > 0.8) session.bot.setControlState('jump', true);
+                else session.bot.setControlState('jump', false);
             }
         }, 5000);
     }
@@ -332,11 +298,7 @@ function handleDisconnect(uid, session) {
     const key = session.type === 'java' ? uid : getSessionKey(uid, session.profileId);
     const map = session.type === 'java' ? javaSessions : sessions;
 
-    if (!map.has(key)) return;
-
-    if (session.afkLoop) clearInterval(session.afkLoop);
-    if (session.actionLoop) clearInterval(session.actionLoop);
-    if (session.uptimeInterval) clearInterval(session.uptimeInterval);
+    if (!map.has(key) || session.isDestroying) return;
 
     if (session.manualStop) {
         notifyUser(uid, `⏹ **${session.type.charAt(0).toUpperCase() + session.type.slice(1)} Bot Stopped.**`);
@@ -355,15 +317,12 @@ function handleDisconnect(uid, session) {
             if (map.has(key) && !map.get(key).manualStop) {
                 if (session.type === 'java') createJavaInstance(uid, session.opts, null, session.rejoinAttempts + 1);
                 else createBedrockInstance(uid, session.profileId, session.opts, null, session.rejoinAttempts + 1);
-            } else {
-                destroySession(uid, session.type, session.profileId);
             }
         }, waitTime);
     }
 }
 
 // ----------------- UI & INTERACTIONS -----------------
-
 client.on(Events.InteractionCreate, async (i) => {
     if (i.guildId && !ALLOWED_GUILDS.includes(i.guildId)) return;
     const uid = i.user.id;
@@ -377,15 +336,9 @@ client.on(Events.InteractionCreate, async (i) => {
         if (i.isButton()) {
             const id = i.customId;
 
-            // ---- Bedrock Buttons ----
             if (id === "pre_bedrock") {
                 const u = getUser(uid);
                 if (!u.server) return i.reply({ content: "❌ **Configuration Missing!** Go to Settings.", ephemeral: true });
-
-                if (uid === ROOT_ID && u.profiles.length > 1) {
-                    const select = new StringSelectMenuBuilder().setCustomId("start_select_bedrock").setPlaceholder("Select Account to Use").addOptions(u.profiles.map(p => ({ label: p.name, value: p.id })));
-                    return i.reply({ content: "Choose a Bedrock account:", components: [new ActionRowBuilder().addComponents(select)], ephemeral: true });
-                }
                 const profileId = u.profiles.length > 0 ? u.profiles[0].id : 'default';
                 return showPreFlight(i, 'bedrock', u, profileId, false);
             }
@@ -401,15 +354,9 @@ client.on(Events.InteractionCreate, async (i) => {
             if (id === "unlink") {
                  const u = getUser(uid);
                  if (u.profiles.length === 0) return i.reply({ content: "❌ No accounts to unlink.", ephemeral: true });
-                 if (uid === ROOT_ID && u.profiles.length > 1) {
-                    const select = new StringSelectMenuBuilder().setCustomId("unlink_select").setPlaceholder("Select Account to Remove").addOptions(u.profiles.map(p => ({ label: p.name, value: p.id })));
-                    return i.reply({ content: "Select account to unlink:", components: [new ActionRowBuilder().addComponents(select)], ephemeral: true });
-                 }
                  unlinkProfile(uid, u.profiles[0].id);
                  return i.reply({ content: "🗑 **Account Unlinked.**", ephemeral: true });
             }
-
-            // ---- Java Buttons ----
             if (id === "pre_java") {
                 const u = getUser(uid);
                 if (!u.java.server) return i.reply({ content: "❌ **Configuration Missing!** Go to Java Settings.", ephemeral: true });
@@ -418,34 +365,23 @@ client.on(Events.InteractionCreate, async (i) => {
             if (id === "start_java") return startJava(uid, i);
             if (id === "stop_java") {
                 if (!javaSessions.has(uid)) return i.reply({ content: "❌ No Java bot running.", ephemeral: true });
-                const s = javaSessions.get(uid);
-                s.manualStop = true;
-                handleDisconnect(uid, s);
+                javaSessions.get(uid).manualStop = true;
+                handleDisconnect(uid, javaSessions.get(uid));
                 return i.reply({ content: "⏹ **Stopping Java bot...**", ephemeral: true });
             }
             if (id === "set_java") return i.showModal(getSettingsModal('java', getUser(uid)));
-
             if (id === "cancel") return i.update({ content: "❌ Cancelled.", components: [], embeds: [] });
         }
 
         if (i.isStringSelectMenu()) {
             const u = getUser(uid);
-            if (i.customId === "sel_bed_ver" || i.customId === "sel_java_ver") {
-                const isJava = i.customId === "sel_java_ver";
-                const type = isJava ? 'java' : 'bedrock';
-                
-                if (isJava) u.java.selectedVersion = i.values[0];
-                else u.bedrockVersion = i.values[0];
-                saveDatabase();
-
-                const profileId = isJava ? null : (u.profiles[0]?.id || 'default');
-                return showPreFlight(i, type, u, profileId, true);
-            }
-            if (i.customId === "start_select_bedrock") return showPreFlight(i, 'bedrock', u, i.values[0], true);
-            if (i.customId === "unlink_select") {
-                unlinkProfile(uid, i.values[0]);
-                return i.update({ content: `🗑 **Profile ${i.values[0]} removed.**`, components: [] });
-            }
+            const isJava = i.customId === "sel_java_ver";
+            const type = isJava ? 'java' : 'bedrock';
+            if (isJava) u.java.selectedVersion = i.values[0];
+            else u.bedrockVersion = i.values[0];
+            saveDatabase();
+            const profileId = isJava ? null : (u.profiles[0]?.id || 'default');
+            return showPreFlight(i, type, u, profileId, true);
         }
 
         if (i.isModalSubmit()) {
@@ -468,7 +404,6 @@ client.on(Events.InteractionCreate, async (i) => {
 
 
 // ----------------- UI HELPERS -----------------
-
 function showPreFlight(i, type, u, profileId, isUpdate) {
     const isJava = type === 'java';
     const currentVer = isJava ? u.java.selectedVersion : u.bedrockVersion;
@@ -480,10 +415,7 @@ function showPreFlight(i, type, u, profileId, isUpdate) {
         new ButtonBuilder().setCustomId("cancel").setLabel("Cancel").setStyle(ButtonStyle.Secondary)
     );
     
-    let content = `**Pre-Flight Check (${isJava ? 'Java' : 'Bedrock'})**\nTarget: \`${server.ip}:${server.port}\`\nVersion: \`${currentVer}\`\n`;
-    if (!isJava) content += `Account: **${u.profiles.find(p => p.id === profileId)?.name || "Default"}**\n`;
-    content += `\n*Ready to join?*`;
-
+    let content = `**Pre-Flight Check (${isJava ? 'Java' : 'Bedrock'})**\nTarget: \`${server.ip}:${server.port}\`\nVersion: \`${currentVer}\`\nReady to join?`;
     const payload = { content: content, components: [verRow, confirmRow], ephemeral: true };
     return isUpdate ? i.update(payload) : i.reply(payload);
 }
@@ -491,17 +423,19 @@ function showPreFlight(i, type, u, profileId, isUpdate) {
 function getSettingsModal(type, u) {
     if (type === 'java') {
         const m = new ModalBuilder().setCustomId("modal_java").setTitle("Java Settings");
-        const ip = new TextInputBuilder().setCustomId("ip").setLabel("IP").setStyle(TextInputStyle.Short).setValue(u.java.server?.ip || "").setRequired(true);
-        const port = new TextInputBuilder().setCustomId("port").setLabel("Port").setStyle(TextInputStyle.Short).setValue(String(u.java.server?.port || 25565));
-        const user = new TextInputBuilder().setCustomId("user").setLabel("Username").setStyle(TextInputStyle.Short).setValue(u.java.offlineUsername || "");
-        m.addComponents(new ActionRowBuilder().addComponents(ip), new ActionRowBuilder().addComponents(port), new ActionRowBuilder().addComponents(user));
+        m.addComponents(
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("ip").setLabel("IP").setStyle(TextInputStyle.Short).setValue(u.java.server?.ip || "").setRequired(true)),
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("port").setLabel("Port").setStyle(TextInputStyle.Short).setValue(String(u.java.server?.port || 25565))),
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("user").setLabel("Username").setStyle(TextInputStyle.Short).setValue(u.java.offlineUsername || ""))
+        );
         return m;
     } else {
         const m = new ModalBuilder().setCustomId("modal_bedrock").setTitle("Bedrock Settings");
-        const ip = new TextInputBuilder().setCustomId("ip").setLabel("IP").setStyle(TextInputStyle.Short).setValue(u.server?.ip || "").setRequired(true);
-        const port = new TextInputBuilder().setCustomId("port").setLabel("Port").setStyle(TextInputStyle.Short).setValue(String(u.server?.port || 19132));
-        const user = new TextInputBuilder().setCustomId("off").setLabel("Offline Username").setStyle(TextInputStyle.Short).setValue(u.offlineUsername || "");
-        m.addComponents(new ActionRowBuilder().addComponents(ip), new ActionRowBuilder().addComponents(port), new ActionRowBuilder().addComponents(user));
+         m.addComponents(
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("ip").setLabel("IP").setStyle(TextInputStyle.Short).setValue(u.server?.ip || "").setRequired(true)),
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("port").setLabel("Port").setStyle(TextInputStyle.Short).setValue(String(u.server?.port || 19132))),
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("off").setLabel("Offline Username").setStyle(TextInputStyle.Short).setValue(u.offlineUsername || ""))
+        );
         return m;
     }
 }
@@ -511,13 +445,12 @@ async function handleLink(uid, interaction) {
     const u = getUser(uid);
     if (uid !== ROOT_ID && u.profiles.length >= 1) return interaction.reply({ content: "❌ You can only link one Xbox account.", ephemeral: true });
     
-    const newProfileId = (u.profiles.length === 0) ? 'default' : crypto.randomUUID().split('-')[0];
+    const newProfileId = crypto.randomUUID().split('-')[0];
     const newAuthDir = getUserAuthDir(uid, newProfileId);
 
     const flow = new Authflow(uid, newAuthDir, { flow: "live", authTitle: Titles.MinecraftNintendoSwitch }, (res) => {
-        const link = res.verification_uri_complete || res.verification_uri;
-        const row = new ActionRowBuilder().addComponents(new ButtonBuilder().setLabel("Login to Microsoft").setStyle(ButtonStyle.Link).setURL(link));
-        interaction.editReply({ content: `🔐 **Code:** \`${res.user_code}\`\n*Link new account...*`, components: [row] }).catch(()=>{});
+        const row = new ActionRowBuilder().addComponents(new ButtonBuilder().setLabel("Login to Microsoft").setStyle(ButtonStyle.Link).setURL(res.verification_uri));
+        interaction.editReply({ content: `🔐 **Code:** \`${res.user_code}\``, components: [row] }).catch(()=>{});
     });
 
     await interaction.deferReply({ ephemeral: true });
@@ -526,8 +459,7 @@ async function handleLink(uid, interaction) {
     try {
         await flow.getMsaToken();
         const u = getUser(uid);
-        const name = `Xbox Account ${u.profiles.length + 1}`;
-        u.profiles.push({ id: newProfileId, name: name, created: Date.now() });
+        u.profiles.push({ id: newProfileId, name: `Xbox Account ${u.profiles.length + 1}`, created: Date.now() });
         saveDatabase();
         interaction.followUp({ content: "✅ **Linked Successfully!**", ephemeral: true });
     } catch (e) {
@@ -540,14 +472,13 @@ async function handleLink(uid, interaction) {
 
 function getVersionSelector(type, current) {
     const versions = type === 'java' ? [
-        { label: "Auto-Detect", value: "auto" }, { label: "1.21", value: "1.21" },
+        { label: "Auto-Detect (Recommended)", value: "auto" }, { label: "1.21", value: "1.21" },
         { label: "1.20.4", value: "1.20.4" }, { label: "1.19.4", value: "1.19.4" },
         { label: "1.18.2", value: "1.18.2" }, { label: "1.16.5", value: "1.16.5" },
         { label: "1.8.9", value: "1.8.9" }
     ] : [
         { label: "1.21.60 (Latest)", value: "1.21.60" }, { label: "1.21.50", value: "1.21.50" },
-        { label: "1.21.40", value: "1.21.40" }, { label: "1.21.0", value: "1.21.0" },
-        { label: "1.20.80", value: "1.20.80" }
+        { label: "1.21.40", value: "1.21.40" }
     ];
 
     return new ActionRowBuilder().addComponents(
@@ -565,7 +496,7 @@ function getPanel(type) {
                 new ButtonBuilder().setCustomId("stop_java").setLabel("⏹ Stop").setStyle(ButtonStyle.Danger),
                 new ButtonBuilder().setCustomId("set_java").setLabel("⚙ Settings").setStyle(ButtonStyle.Primary)
         )];
-    } else { // bedrock
+    } else {
         return [
             new ActionRowBuilder().addComponents(
                 new ButtonBuilder().setCustomId("pre_bedrock").setLabel("▶ Start").setStyle(ButtonStyle.Success),
