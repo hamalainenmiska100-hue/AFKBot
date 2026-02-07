@@ -157,7 +157,7 @@ function getAdminStatsEmbed() {
   const minutes = Math.floor((uptime % 3600) / 60);
   
   const embed = new EmbedBuilder()
-    .setTitle("🛠 System Administration Control")
+    .setTitle("🛠 Admin Panel")
     .setColor("#2f3136")
     .addFields(
       { name: "📊 Performance", value: `**RAM:** ${ramMB} MB\n**Uptime:** ${hours}h ${minutes}m`, inline: true },
@@ -460,7 +460,7 @@ client.on(Events.InteractionCreate, async (i) => {
         modal.addComponents(
           new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("ip").setLabel("Server IP").setStyle(TextInputStyle.Short).setRequired(true).setValue(u.server?.ip || "")),
           new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("port").setLabel("Port").setStyle(TextInputStyle.Short).setRequired(true).setValue(String(u.server?.port || 19132))),
-          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("offline").setLabel("Offline Username").setStyle(TextInputStyle.Short).setRequired(false).setValue(u.offlineUsername || ""))
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("offline").setLabel("Offline Username (Discontinued, Not usable)").setStyle(TextInputStyle.Short).setRequired(false).setValue(u.offlineUsername || ""))
         );
         return i.showModal(modal);
       }
