@@ -24,7 +24,7 @@ if (!DISCORD_TOKEN) {
   process.exit(1);
 }
 
-// ----------------- Asetukset (Updated) -----------------
+// ----------------- Config -----------------
 const ALLOWED_GUILD_ID = "1462335230345089254";
 const ADMIN_ID = "1144987924123881564";
 const LOG_CHANNEL_ID = "1464615030111731753";
@@ -107,10 +107,9 @@ function denyIfWrongGuild(i) {
 }
 
 // ----------------- UI helpers -----------------
-// EDIT: The "Start" button now has a dynamic customId
 function panelRow(isJava = false) {
   const title = isJava ? "Java AFKBot Panel 🎛️" : "Bedrock AFKBot Panel 🎛️";
-  const startCustomId = isJava ? "start_java" : "start_bedrock"; // Differentiate start buttons
+  const startCustomId = isJava ? "start_java" : "start_bedrock";
   
   return {
     content: `**${title}**`,
@@ -121,9 +120,6 @@ function panelRow(isJava = false) {
         new ButtonBuilder().setCustomId(startCustomId).setLabel("▶ Start").setStyle(ButtonStyle.Success),
         new ButtonBuilder().setCustomId("stop").setLabel("⏹ Stop").setStyle(ButtonStyle.Danger),
         new ButtonBuilder().setCustomId("settings").setLabel("⚙ Settings").setStyle(ButtonStyle.Secondary)
-      ),
-      new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId("more").setLabel("➕ More").setStyle(ButtonStyle.Secondary)
       )
     ]
   };
@@ -231,7 +227,7 @@ async function linkMicrosoft(uid, interaction) {
   pendingLink.set(uid, p);
 }
 
-// ----------------- Bedrock session -----------------
+// ----------------- Session Logic -----------------
 function cleanupSession(uid) {
   const s = sessions.get(uid);
   if (!s) return;
@@ -255,20 +251,23 @@ async function startSession(uid, interaction) {
   const { ip, port } = u.server;
 
   if (sessions.has(uid)) {
-      return interaction.editReply("⚠️ **Active Session Detected**: Please terminate your current bot session before initiating a new connection.").catch(() => {});
+      return interaction.editReply("⚠️ **Session Conflict**: An active bot session is already associated with your account. Please terminate your active session to start a new one.").catch(() => {});
   }
 
+  // --- FIXED MOTD PING CHECK ---
   try {
-      await interaction.editReply({ content: "🔍 Validating server status...", embeds: [], components: [] }).catch(() => {});
-      await bedrock.ping({ host: ip, port: port, timeout: 5000 });
+      await interaction.editReply({ content: "🔍 Pinging server...", embeds: [], components: [] }).catch(() => {});
+      // Force port to integer for bedrock.ping
+      const pingPort = parseInt(port) || 19132;
+      await bedrock.ping({ host: ip, port: pingPort, timeout: 5000 });
       await interaction.editReply("✅ **Server found! Joining...**").catch(() => {});
   } catch (err) {
-      logToDiscord(`❌ Connection failure for <@${uid}>: Server ${ip}:${port} is offline.`);
-      return interaction.editReply(`❌ **Connection Failed**: The destination server is currently offline. Connection aborted.`).catch(() => {});
+      logToDiscord(`❌ Connection failure for <@${uid}>: Server ${ip}:${port} is offline or unreachable.`);
+      return interaction.editReply(`❌ **Connection Failed**: The server is currently offline. Bot cannot join.`).catch(() => {});
   }
 
   const authDir = getUserAuthDir(uid);
-  const opts = { host: ip, port, connectTimeout: 47000, keepAlive: true };
+  const opts = { host: ip, port: parseInt(port), connectTimeout: 47000, keepAlive: true };
 
   if (u.connectionType === "offline") {
     opts.username = u.offlineUsername || `AFK_${uid.slice(-4)}`;
@@ -301,7 +300,7 @@ async function startSession(uid, interaction) {
   mc.on("spawn", () => {
     currentSession.connected = true;
     clearTimeout(currentSession.timeout);
-    interaction.editReply(`🟢 **Successfully Connected** to **${ip}:${port}**. AFK sequence active.`).catch(() => {});
+    interaction.editReply(`🟢 **Successfully Connected** to **${ip}:${port}**`).catch(() => {});
     logToDiscord(`✅ Bot of <@${uid}> spawned on **${ip}:${port}**`);
   });
 
@@ -347,20 +346,16 @@ client.on(Events.InteractionCreate, async (i) => {
     }
 
     if (i.isButton()) {
-      if (i.customId.startsWith("admin_")) {
-        if (i.customId === "admin_refresh") {
-          return i.update({ embeds: [getAdminStatsEmbed()], components: adminPanelComponents() });
-        }
-        return; 
+      if (i.customId === "admin_refresh") {
+        return i.update({ embeds: [getAdminStatsEmbed()], components: adminPanelComponents() });
       }
 
-      // --- NEW: Context-aware confirmation flows ---
       if (i.customId === "start_bedrock") {
-        if (sessions.has(uid)) return i.reply({ ephemeral: true, content: "⚠️ **Session Conflict**: An active bot session is already running." });
+        if (sessions.has(uid)) return i.reply({ ephemeral: true, content: "⚠️ **Session Conflict**: Please terminate your last session to start a new one." });
         
         const embed = new EmbedBuilder()
             .setTitle("Bedrock Server Connection")
-            .setDescription("Please confirm that you wish to initiate a connection to the specified Bedrock server.")
+            .setDescription("Confirm initiation of bot connection to the configured Bedrock server.")
             .setColor("#2ECC71");
 
         const row = new ActionRowBuilder().addComponents(
@@ -371,35 +366,29 @@ client.on(Events.InteractionCreate, async (i) => {
       }
 
       if (i.customId === "start_java") {
-        if (sessions.has(uid)) return i.reply({ ephemeral: true, content: "⚠️ **Session Conflict**: An active bot session is already running." });
+        if (sessions.has(uid)) return i.reply({ ephemeral: true, content: "⚠️ **Session Conflict**: Please terminate your last session to start a new one." });
 
         const embed = new EmbedBuilder()
-          .setTitle("⚙️ Java Server Pre-Connection Check")
-          .setDescription("For a successful connection, please ensure the target Java server has the following plugins installed and correctly configured. **This bot cannot connect otherwise.**")
+          .setTitle("⚙️ Java Compatibility Check")
+          .setDescription("For a successful connection to a Java server, ensure the following plugins are installed. If you haven't installed these, it's not gonna work.")
           .addFields(
-              { name: "GeyserMC", value: "Translates packets between Bedrock and Java.", inline: true },
-              { name: "Floodgate", value: "Allows Bedrock clients to join without a Java account.", inline: true },
-              { name: "ViaVersion / ViaBackwards", value: "Ensures compatibility across different Minecraft versions.", inline: false }
+              { name: "Required Plugins", value: "• GeyserMC\n• Floodgate\n• ViaVersion\n• ViaBackwards" }
           )
-          .setColor("#E67E22")
-          .setFooter({ text: "These plugins are required on the server you are connecting to." });
+          .setColor("#E67E22");
 
         const row = new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId("confirm_start").setLabel("I Confirm & Start").setStyle(ButtonStyle.Success),
+            new ButtonBuilder().setCustomId("confirm_start").setLabel("Confirm & Start").setStyle(ButtonStyle.Success),
             new ButtonBuilder().setCustomId("cancel").setLabel("Cancel").setStyle(ButtonStyle.Secondary)
         );
         return i.reply({ embeds: [embed], components: [row], ephemeral: true });
       }
 
-      // This button is now triggered by BOTH Java and Bedrock confirmations
       if (i.customId === "confirm_start") {
           await i.deferUpdate();
           return startSession(uid, i);
       }
 
-      if (i.customId === "cancel") {
-          return i.update({ content: "❌ Connection initiative has been cancelled.", embeds: [], components: [] });
-      }
+      if (i.customId === "cancel") return i.update({ content: "❌ Cancelled.", embeds: [], components: [] });
       
       if (i.customId === "stop") {
         const ok = stopSession(uid);
@@ -435,7 +424,7 @@ client.on(Events.InteractionCreate, async (i) => {
         u.server = { ip, port };
         u.offlineUsername = i.fields.getTextInputValue("offline").trim();
         save();
-        return i.reply({ ephemeral: true, content: `✅ Configuration saved for **${ip}:${port}**` });
+        return i.reply({ ephemeral: true, content: `✅ Saved: **${ip}:${port}**` });
     }
 
   } catch (e) {
