@@ -45,11 +45,12 @@ function save() {
 
 function getUser(uid) {
   if (!users[uid]) users[uid] = {};
-  if (!users[uid].connectionType) users[uid].connectionType = "online";
+  // Pakotetaan tyypiksi aina online
+  users[uid].connectionType = "online"; 
   if (!users[uid].bedrockVersion) users[uid].bedrockVersion = "auto";
-  if (!users[uid].offlineUsername) users[uid].offlineUsername = `AFK_${uid.slice(-4)}`;
   return users[uid];
 }
+
 
 function getUserAuthDir(uid) {
   const dir = path.join(AUTH_ROOT, uid);
