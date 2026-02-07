@@ -244,26 +244,50 @@ function stopSession(uid) {
   return true;
 }
 
-async function startSession(uid, interaction) {
+// FIXED START SESSION FUNCTION
+async function startSession(uid, interaction, isReconnect = false) {
   const u = getUser(uid);
-  if (!u.server) return interaction.editReply("⚠ Please configure your server settings first.");
+  
+  // Helper to reply safely (interaction might be dead if reconnecting)
+  const reply = async (msgObj) => {
+    if (!isReconnect && interaction) {
+      try {
+        if (typeof msgObj === 'string') await interaction.editReply(msgObj);
+        else await interaction.editReply(msgObj);
+      } catch (e) { /* ignore expired interaction */ }
+    }
+  };
+
+  if (!u.server) {
+      await reply("⚠ Please configure your server settings first.");
+      return;
+  }
 
   const { ip, port } = u.server;
 
-  if (sessions.has(uid)) {
-      return interaction.editReply("⚠️ **Session Conflict**: An active bot session is already associated with your account. Please terminate your active session to start a new one.").catch(() => {});
+  // FIX 1: Allow bypass if reconnecting
+  if (sessions.has(uid) && !isReconnect) {
+      return reply("⚠️ **Session Conflict**: An active bot session is already associated with your account. Please terminate your active session to start a new one.").catch(() => {});
   }
 
-  // --- FIXED MOTD PING CHECK ---
+  // --- MOTD PING CHECK ---
   try {
-      await interaction.editReply({ content: "🔍 Pinging server...", embeds: [], components: [] }).catch(() => {});
-      // Force port to integer for bedrock.ping
+      if (!isReconnect) await reply({ content: "🔍 Pinging server...", embeds: [], components: [] }).catch(() => {});
+      
       const pingPort = parseInt(port) || 19132;
       await bedrock.ping({ host: ip, port: pingPort, timeout: 5000 });
-      await interaction.editReply("✅ **Server found! Joining...**").catch(() => {});
+      
+      if (!isReconnect) await reply("✅ **Server found! Joining...**").catch(() => {});
   } catch (err) {
       logToDiscord(`❌ Connection failure for <@${uid}>: Server ${ip}:${port} is offline or unreachable.`);
-      return interaction.editReply(`❌ **Connection Failed**: The server is currently offline. Bot cannot join.`).catch(() => {});
+      if (isReconnect) {
+          // If server is down during auto-reconnect, maybe retry later or stop? 
+          // For now, we just stop to prevent infinite loops of errors if server is dead.
+          // Or you can trigger handleAutoReconnect again here if you want infinite retries.
+      } else {
+          await reply(`❌ **Connection Failed**: The server is currently offline. Bot cannot join.`).catch(() => {});
+      }
+      return; // Stop execution
   }
 
   const authDir = getUserAuthDir(uid);
@@ -279,7 +303,16 @@ async function startSession(uid, interaction) {
   }
 
   const mc = bedrock.createClient(opts);
-  const currentSession = { client: mc, timeout: null, startedAt: Date.now(), manualStop: false, connected: false };
+  
+  // Create session object. Overwrites existing key if reconnecting.
+  const currentSession = { 
+      client: mc, 
+      timeout: null, 
+      startedAt: Date.now(), 
+      manualStop: false, 
+      connected: false,
+      isReconnecting: false // Reset flag
+  };
   sessions.set(uid, currentSession);
 
   const waitForEntity = setInterval(() => {
@@ -300,29 +333,43 @@ async function startSession(uid, interaction) {
   mc.on("spawn", () => {
     currentSession.connected = true;
     clearTimeout(currentSession.timeout);
-    interaction.editReply(`🟢 **Successfully Connected** to **${ip}:${port}**`).catch(() => {});
-    logToDiscord(`✅ Bot of <@${uid}> spawned on **${ip}:${port}**`);
+    if (!isReconnect) reply(`🟢 **Successfully Connected** to **${ip}:${port}**`).catch(() => {});
+    logToDiscord(`✅ Bot of <@${uid}> spawned on **${ip}:${port}**` + (isReconnect ? " (Auto-Rejoined)" : ""));
   });
 
   mc.on("error", (e) => {
-    if (!currentSession.manualStop) handleAutoReconnect(uid, interaction);
+    // Pass null interaction for error handling
+    if (!currentSession.manualStop) handleAutoReconnect(uid); 
     logToDiscord(`❌ Bot of <@${uid}> error: \`${e.message}\``);
   });
 
   mc.on("close", () => {
-    if (!currentSession.manualStop) handleAutoReconnect(uid, interaction);
+    // Pass null interaction for close handling
+    if (!currentSession.manualStop) handleAutoReconnect(uid);
     logToDiscord(`🔌 Bot of <@${uid}> connection closed.`);
   });
 }
 
-function handleAutoReconnect(uid, interaction) {
+// FIXED AUTO RECONNECT
+function handleAutoReconnect(uid) {
     const s = sessions.get(uid);
+    // If session doesn't exist, or stopped manually, or already waiting to reconnect, ignore.
     if (!s || s.manualStop || s.reconnectTimer) return;
+    
     s.isReconnecting = true;
+    logToDiscord(`⏳ Bot of <@${uid}> disconnected. Reconnecting in 2 minutes...`);
+
     s.reconnectTimer = setTimeout(() => {
-        if (sessions.has(uid) && !s.manualStop) {
-            s.reconnectTimer = null;
-            startSession(uid, interaction);
+        // Check if session still exists and wasn't manually stopped in the meantime
+        if (sessions.has(uid)) {
+            const checkS = sessions.get(uid);
+            if (!checkS.manualStop) {
+                checkS.reconnectTimer = null;
+                // FIX 2 & 3: Pass null for interaction, and true for isReconnect
+                startSession(uid, null, true);
+            } else {
+                cleanupSession(uid);
+            }
         }
     }, 120000); 
 }
@@ -385,7 +432,8 @@ client.on(Events.InteractionCreate, async (i) => {
 
       if (i.customId === "confirm_start") {
           await i.deferUpdate();
-          return startSession(uid, i);
+          // Normal start, isReconnect = false
+          return startSession(uid, i, false);
       }
 
       if (i.customId === "cancel") return i.update({ content: "❌ Cancelled.", embeds: [], components: [] });
