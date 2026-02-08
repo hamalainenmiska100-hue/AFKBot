@@ -23,7 +23,7 @@ let Vec3;
 try {
   Vec3 = require("vec3");
 } catch (e) {
-  console.log("⚠️  Physics dependencies missing! Bot will not fall. Run: npm install vec3");
+  console.log("⚠️  Physics dependencies missing! Bot will not fall or walk. Run: npm install vec3");
 }
 
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
@@ -352,7 +352,6 @@ async function startSession(uid, interaction, isReconnect = false) {
   const { ip, port } = u.server;
 
   if (sessions.has(uid) && !isReconnect) {
-      // Check if it's just a zombie session
       const zombie = sessions.get(uid);
       if (!zombie.connected && !zombie.isReconnecting) {
           cleanupSession(uid);
@@ -384,7 +383,7 @@ async function startSession(uid, interaction, isReconnect = false) {
       port: parseInt(port), 
       connectTimeout: 60000, 
       keepAlive: true,
-      viewDistance: 4, // OPTIMIZED for RAM
+      viewDistance: 4, 
       profilesFolder: authDir,
       username: uid,
       offline: false
@@ -404,13 +403,15 @@ async function startSession(uid, interaction, isReconnect = false) {
       manualStop: false, 
       connected: false,
       isReconnecting: false,
-      // Physics Data
-      // Initialized to null to wait for start_game
+      // --- MODIFIED: More advanced physics state ---
       position: null,
       velocity: (Vec3) ? new Vec3(0, 0, 0) : null,
       yaw: 0,
       pitch: 0,
       onGround: false,
+      // --- NEW: State for walking AI ---
+      isWalking: false,
+      targetPosition: null, 
       // Timers
       reconnectTimer: null,
       physicsLoop: null,
@@ -419,43 +420,49 @@ async function startSession(uid, interaction, isReconnect = false) {
   sessions.set(uid, currentSession);
 
   // ==========================================
-  // 🍎 GRAVITY & PHYSICS ENGINE (Server Corrected)
+  // 🍎 ADVANCED PHYSICS & WALKING ENGINE
   // ==========================================
   if (Vec3) {
-      // 3. Gravity / Physics Loop (20 TPS)
       currentSession.physicsLoop = setInterval(() => {
-          // CRITICAL FIX: Do not run physics if we haven't received spawn coordinates yet.
           if (!currentSession.connected || !currentSession.position) return;
           
           const gravity = 0.08; 
-          
-          // Always try to apply gravity if not grounded
-          if (!currentSession.onGround) {
-             currentSession.velocity.y -= gravity;
-          } else {
-             // Keep a tiny downward velocity to stick to the floor
-             currentSession.velocity.y = -0.01;
+          const moveVector = { x: 0, z: 0 }; // Default to standing still
+
+          // --- NEW: Walking Logic ---
+          if (currentSession.isWalking && currentSession.targetPosition) {
+              const distance = currentSession.position.distanceTo(currentSession.targetPosition);
+              
+              if (distance > 0.5) { // Stop when close to target
+                  const direction = currentSession.targetPosition.minus(currentSession.position).normalize();
+                  moveVector.x = direction.x;
+                  moveVector.z = direction.z;
+              } else {
+                  currentSession.isWalking = false; // Arrived at destination
+              }
           }
 
-          // Terminal velocity
-          if (currentSession.velocity.y < -3.0) currentSession.velocity.y = -3.0;
+          // --- MODIFIED: Aggressive Grounding Physics ---
+          if (!currentSession.onGround) {
+             currentSession.velocity.y -= gravity;
+          }
+
+          if (currentSession.velocity.y < -3.92) currentSession.velocity.y = -3.92; // Terminal velocity
           
-          // Apply velocity
           currentSession.position.add(currentSession.velocity);
 
-          // Void Protection
           if (currentSession.position.y < -64) {
-             currentSession.position.y = 100; // Rubberband up
+             currentSession.position.y = 320; 
              currentSession.velocity.y = 0;
           }
 
-          // SEND POSITION PACKET (Heartbeat)
+          // SEND THE COMBINED PHYSICS + WALKING PACKET
           try {
               mc.write("player_auth_input", {
                  pitch: currentSession.pitch,
                  yaw: currentSession.yaw,
                  position: { x: currentSession.position.x, y: currentSession.position.y, z: currentSession.position.z },
-                 move_vector: { x: 0, z: 0 },
+                 move_vector: moveVector, // --- THIS MAKES IT WALK ---
                  head_yaw: currentSession.yaw,
                  input_data: 0n,
                  input_mode: "mouse",
@@ -465,34 +472,38 @@ async function startSession(uid, interaction, isReconnect = false) {
               });
           } catch (e) {}
 
-      }, 50); // 20 times a second
+      }, 50); 
   }
 
   // ==========================================
-  // 🤖 HUMAN-LIKE ANTI-AFK
+  // 🤖 ANTI-AFK & WALKING AI CONTROLLER
   // ==========================================
   const performAntiAfk = () => {
       if (!sessions.has(uid)) return;
       const s = sessions.get(uid);
       
-      // Guard clause
       if (!s.connected || !s.position) {
           s.afkTimeout = setTimeout(performAntiAfk, 5000);
           return;
       }
 
       try {
-          // Randomize look direction
-          s.yaw += (Math.random() - 0.5) * 10; 
-          s.pitch += (Math.random() - 0.5) * 5;
+          // --- MODIFIED: Now controls walking state ---
+          // Every 10-30 seconds, decide to do something
+          const action = Math.random();
+          if (action > 0.5 && !s.isWalking) {
+              // Decide to walk back to spawn
+              s.isWalking = true;
+          } else {
+              // Just look around and maybe jump
+              s.yaw += (Math.random() - 0.5) * 20; 
+              s.pitch += (Math.random() - 0.5) * 10;
 
-          // Occasional Jump (only if grounded)
-          if (s.onGround && Math.random() > 0.8) {
-              s.velocity.y = 0.42;
-              s.onGround = false;
+              if (s.onGround && Math.random() > 0.9) {
+                  s.velocity.y = 0.42; // Jump
+                  s.onGround = false;
+              }
           }
-          
-          // Send update (Physics loop handles the position packet, we just updated yaw/pitch/velocity)
           
           // Swing Arm
           mc.write('animate', {
@@ -502,23 +513,24 @@ async function startSession(uid, interaction, isReconnect = false) {
 
       } catch (e) {}
 
-      // Schedule next action (Random: 2s to 10s)
-      const nextDelay = Math.random() * 8000 + 2000;
+      // Schedule next decision
+      const nextDelay = Math.random() * 20000 + 10000;
       s.afkTimeout = setTimeout(performAntiAfk, nextDelay);
   };
 
 
   // --- EVENTS ---
   mc.on("spawn", () => {
-    // We log here, but physics waits for start_game
     logToDiscord(`✅ Bot of <@${uid}> spawned on **${ip}:${port}**` + (isReconnect ? " (Auto-Rejoined)" : ""));
     if (!isReconnect) safeReply(interaction, `🟢 **Connected**`);
   });
 
-  // Use start_game to get the initial coordinates safely
+  // This is the most important event for initialization
   mc.on("start_game", (packet) => {
       if (Vec3) {
           currentSession.position = new Vec3(packet.player_position.x, packet.player_position.y, packet.player_position.z);
+          // --- NEW: Set the initial walking target ---
+          currentSession.targetPosition = currentSession.position.clone();
       }
       currentSession.entityId = packet.runtime_entity_id;
       currentSession.connected = true;
@@ -527,29 +539,30 @@ async function startSession(uid, interaction, isReconnect = false) {
       performAntiAfk();
   });
   
-  // SERVER CORRECTION: This fixes the floating issue
+  // --- MODIFIED: This is now the key to fixing hovering ---
   mc.on("move_player", (packet) => {
       if (packet.runtime_id === currentSession.entityId && currentSession.position) {
-          const serverY = packet.position.y;
-          const clientY = currentSession.position.y;
-
-          // If server stopped our fall, we are on ground
-          if (serverY >= clientY) {
+          
+          // If the server corrects our Y position upwards, it means we hit a solid block.
+          if (packet.position.y > currentSession.position.y) {
+              // We have landed on the ground.
               currentSession.onGround = true;
               currentSession.velocity.y = 0;
           } else {
+              // We are likely falling.
               currentSession.onGround = false;
           }
-
+          
+          // Always accept the server's position as the source of truth.
           currentSession.position.set(packet.position.x, packet.position.y, packet.position.z);
       }
   });
   
-  // Respawn Handling
   mc.on("respawn", (packet) => {
       logToDiscord(`💀 Bot of <@${uid}> died and respawned.`);
       if (currentSession.position) {
           currentSession.position.set(packet.position.x, packet.position.y, packet.position.z);
+          currentSession.targetPosition = currentSession.position.clone(); // Reset walk target
           currentSession.velocity.set(0,0,0);
       }
   });
