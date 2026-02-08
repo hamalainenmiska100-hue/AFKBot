@@ -18,7 +18,7 @@ const { Authflow, Titles } = require("prismarine-auth");
 const fs = require("fs");
 const path = require("path");
 
-// --- RE-ADDED: Dependencies for Chunk Scanning & Bed Detection ---
+// --- Dependencies for Chunk Scanning & Bed Detection ---
 let Vec3, PrismarineChunk, PrismarineRegistry, MinecraftData;
 try {
   Vec3 = require("vec3");
@@ -381,12 +381,10 @@ async function startSession(uid, interaction, isReconnect = false) {
       onGround: false,
       isWalking: false,
       targetPosition: null, 
-      isTryingToSleep: false, // --- NEW: State for bed AI ---
-      // --- NEW: For chunk parsing ---
+      isTryingToSleep: false,
       chunks: new Map(),
       registry: null,
       Chunk: null,
-      // Timers
       reconnectTimer: null,
       physicsLoop: null,
       afkTimeout: null,
@@ -398,27 +396,23 @@ async function startSession(uid, interaction, isReconnect = false) {
   // 🍎 ADVANCED PHYSICS, WALKING & CHUNK ENGINE
   // ==========================================
   if (Vec3 && PrismarineChunk) {
-      // Initialize Registry and Chunk loader
       try {
-          // We guess the version. Bedrock is not standardized like Java.
           currentSession.registry = PrismarineRegistry('bedrock_1.20.0');
           currentSession.Chunk = PrismarineChunk(currentSession.registry);
       } catch (e) {
           logToDiscord(`Could not initialize chunk manager for <@${uid}>. Bed detection disabled.`);
-          currentSession.Chunk = null; // Disable if failed
+          currentSession.Chunk = null;
       }
       
-      // --- RE-ADDED: Chunk Loading ---
       mc.on('level_chunk', (packet) => {
           if (!currentSession.Chunk) return;
           try {
               const chunk = new currentSession.Chunk();
               chunk.load(packet.payload);
               currentSession.chunks.set(`${packet.x},${packet.z}`, chunk);
-          } catch(e) { /* ignore chunk load errors */ }
+          } catch(e) {}
       });
       
-      // --- RE-ADDED: Chunk Garbage Collector for RAM ---
       currentSession.chunkGCLoop = setInterval(() => {
           if (currentSession.chunks.size > 50) {
               currentSession.chunks.clear();
@@ -479,7 +473,6 @@ async function startSession(uid, interaction, isReconnect = false) {
       }
 
       try {
-          // --- NEW: Trigger bed scan ---
           scanForBedAndSleep(uid);
 
           const action = Math.random();
@@ -503,13 +496,13 @@ async function startSession(uid, interaction, isReconnect = false) {
   };
 
   // ==========================================
-  // 🛌 BED DETECTION AI
+  // 🛌 BED DETECTION AI (IMPROVED)
   // ==========================================
   function scanForBedAndSleep(uid) {
       const s = sessions.get(uid);
       if (!s || !s.Chunk || !s.position || s.isTryingToSleep) return;
 
-      const searchRadius = 3; // 3 blocks in each direction
+      const searchRadius = 3;
       const playerPos = s.position.floored();
 
       for (let x = -searchRadius; x <= searchRadius; x++) {
@@ -527,20 +520,27 @@ async function startSession(uid, interaction, isReconnect = false) {
                           logToDiscord(`🛌 Bed found for <@${uid}> at ${checkPos}. Attempting to sleep.`);
                           s.isTryingToSleep = true;
                           
-                          // Use the correct packet to interact with the bed
+                          // --- NEW: Dual Packet System for Sleeping ---
+                          // Packet 1: The "Right-Click"
                           mc.write('inventory_transaction', {
                               transaction: {
-                                  transaction_type: 'item_use_on_block',
-                                  action_type: 0,
-                                  block_position: checkPos,
-                                  block_face: 1, // 1 is typically 'up'
-                                  hotbar_slot: 0, // Assuming empty hand
-                                  item_in_hand: { network_id: 0 },
-                                  player_position: s.position,
+                                  transaction_type: 'item_use_on_block', action_type: 0,
+                                  block_position: checkPos, block_face: 1, hotbar_slot: 0,
+                                  item_in_hand: { network_id: 0 }, player_position: s.position,
                                   click_position: { x: 0, y: 0, z: 0 }
                               }
                           });
-                          return; // Stop scanning once a bed is found and used
+
+                          // Packet 2: The "Explicit Intent"
+                          mc.write('player_action', {
+                              runtime_entity_id: s.entityId || 0n,
+                              action: 'start_sleeping',
+                              position: checkPos,
+                              result_code: 0,
+                              face: 0
+                          });
+
+                          return; 
                       }
                   }
               }
@@ -574,10 +574,7 @@ async function startSession(uid, interaction, isReconnect = false) {
           } else {
               currentSession.onGround = false;
           }
-          
-          // If we are moved, we are no longer trying to sleep
           currentSession.isTryingToSleep = false;
-          
           currentSession.position.set(packet.position.x, packet.position.y, packet.position.z);
       }
   });
@@ -612,7 +609,7 @@ client.on(Events.InteractionCreate, async (i) => {
 
     if (i.isChatInputCommand()) {
       if (i.commandName === "panel") return safeReply(i, panelRow(false));
-      if (i.commandName === "java") return safeReply(i, panelRow(true)); // Restored
+      if (i.commandName === "java") return safeReply(i, panelRow(true));
       if (i.commandName === "admin") {
         if (uid !== ADMIN_ID || i.channelId !== ADMIN_CHANNEL_ID) return safeReply(i, { content: "⛔ Access restricted.", ephemeral: true });
         const msg = await i.reply({ embeds: [getAdminStatsEmbed()], components: adminPanelComponents(), fetchReply: true });
@@ -636,16 +633,13 @@ client.on(Events.InteractionCreate, async (i) => {
         return i.reply({ embeds: [embed], components: [row], ephemeral: true }).catch(() => {});
       }
 
-      // --- RESTORED: Java Button Logic ---
       if (i.customId === "start_java") {
         if (sessions.has(uid)) return safeReply(i, { ephemeral: true, content: "⚠️ **Session Conflict**: Active session exists." });
-
         const embed = new EmbedBuilder()
           .setTitle("⚙️ Java Compatibility Check")
           .setDescription("For a successful connection to a Java server, ensure the following plugins are installed.")
           .addFields( { name: "Required Plugins", value: "• GeyserMC\n• Floodgate" } )
           .setColor("#E67E22");
-
         const row = new ActionRowBuilder().addComponents(
             new ButtonBuilder().setCustomId("confirm_start").setLabel("Confirm & Start").setStyle(ButtonStyle.Success),
             new ButtonBuilder().setCustomId("cancel").setLabel("Cancel").setStyle(ButtonStyle.Secondary)
