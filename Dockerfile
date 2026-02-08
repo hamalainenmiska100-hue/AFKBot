@@ -2,7 +2,6 @@
 FROM node:22-bookworm
 
 # Install build tools required for native modules (RakNet, etc.)
-# Removed heavy graphics libraries not needed for headless bots
 RUN apt-get update && apt-get install -y \
     build-essential \
     cmake \
@@ -21,4 +20,4 @@ RUN npm install
 COPY . .
 
 # Start the bot
-CMD ["npm", "start"]
+CMD ["node", "bot.js"]
