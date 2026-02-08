@@ -45,7 +45,6 @@ function save() {
 
 function getUser(uid) {
   if (!users[uid]) users[uid] = {};
-  // Pakotetaan tyypiksi aina online
   users[uid].connectionType = "online"; 
   if (!users[uid].bedrockVersion) users[uid].bedrockVersion = "auto";
   return users[uid];
@@ -245,17 +244,16 @@ function stopSession(uid) {
   return true;
 }
 
-// FIXED START SESSION FUNCTION
+// FIXED START SESSION FUNCTION WITH ANTI-CHEAT BYPASS
 async function startSession(uid, interaction, isReconnect = false) {
   const u = getUser(uid);
   
-  // Helper to reply safely (interaction might be dead if reconnecting)
   const reply = async (msgObj) => {
     if (!isReconnect && interaction) {
       try {
         if (typeof msgObj === 'string') await interaction.editReply(msgObj);
         else await interaction.editReply(msgObj);
-      } catch (e) { /* ignore expired interaction */ }
+      } catch (e) { }
     }
   };
 
@@ -266,12 +264,10 @@ async function startSession(uid, interaction, isReconnect = false) {
 
   const { ip, port } = u.server;
 
-  // FIX 1: Allow bypass if reconnecting
   if (sessions.has(uid) && !isReconnect) {
-      return reply("⚠️ **Session Conflict**: An active bot session is already associated with your account. Please terminate your active session to start a new one.").catch(() => {});
+      return reply("⚠️ **Session Conflict**: An active bot session is already associated with your account.").catch(() => {});
   }
 
-  // --- MOTD PING CHECK ---
   try {
       if (!isReconnect) await reply({ content: "🔍 Pinging server...", embeds: [], components: [] }).catch(() => {});
       
@@ -281,14 +277,8 @@ async function startSession(uid, interaction, isReconnect = false) {
       if (!isReconnect) await reply("✅ **Server found! Joining...**").catch(() => {});
   } catch (err) {
       logToDiscord(`❌ Connection failure for <@${uid}>: Server ${ip}:${port} is offline or unreachable.`);
-      if (isReconnect) {
-          // If server is down during auto-reconnect, maybe retry later or stop? 
-          // For now, we just stop to prevent infinite loops of errors if server is dead.
-          // Or you can trigger handleAutoReconnect again here if you want infinite retries.
-      } else {
-          await reply(`❌ **Connection Failed**: The server is currently offline. Bot cannot join.`).catch(() => {});
-      }
-      return; // Stop execution
+      if (!isReconnect) await reply(`❌ **Connection Failed**: The server is currently offline.`).catch(() => {});
+      return;
   }
 
   const authDir = getUserAuthDir(uid);
@@ -305,31 +295,57 @@ async function startSession(uid, interaction, isReconnect = false) {
 
   const mc = bedrock.createClient(opts);
   
-  // Create session object. Overwrites existing key if reconnecting.
   const currentSession = { 
       client: mc, 
       timeout: null, 
       startedAt: Date.now(), 
       manualStop: false, 
       connected: false,
-      isReconnecting: false // Reset flag
+      isReconnecting: false
   };
   sessions.set(uid, currentSession);
 
+  // ---------------------------------------------------------
+  // UPDATED ANTI-AFK / ANTI-CHEAT BYPASS LOGIC
+  // ---------------------------------------------------------
   const waitForEntity = setInterval(() => {
+    // Wait until bot spawns and has a valid entity ID
     if (!mc.entity || !mc.entityId) return;
     clearInterval(waitForEntity);
-    let moveToggle = false;
+
+    // Every 15 seconds, send the bypass packet
     const afkInterval = setInterval(() => {
       try {
-        const pos = { ...mc.entity.position };
-        pos.x += moveToggle ? 0.5 : -0.5;
-        moveToggle = !moveToggle;
-        mc.write("move_player", { runtime_id: mc.entityId, position: pos, pitch: 0, yaw: 0, head_yaw: 0, mode: 0, on_ground: true, ridden_runtime_id: 0, teleport: false });
-      } catch {}
-    }, 60 * 1000);
+        if (!mc.entity || !mc.entity.position) return;
+        
+        // Input Flag: JUMP_DOWN (usually bit 3, value 8)
+        // We use BigInt (8n) to be safe with protocol libraries
+        const JUMP_FLAG = 8n; 
+
+        mc.write("player_auth_input", {
+          pitch: 0,
+          yaw: 0,
+          position: { 
+            x: mc.entity.position.x, 
+            y: mc.entity.position.y, 
+            z: mc.entity.position.z 
+          },
+          move_vector: { x: 0, z: 0 },
+          head_yaw: 0,
+          input_data: JUMP_FLAG, // Forces the server to think SPACE is held
+          input_mode: "mouse",
+          play_mode: "screen",
+          interaction_model: "touch",
+          tick: 0n // Basic tick handling
+        });
+      } catch (e) {
+        // Silently fail if packet fails, preventing crash
+      }
+    }, 15000); // 15 Seconds
+
     mc.once("close", () => clearInterval(afkInterval));
   }, 1000);
+  // ---------------------------------------------------------
 
   mc.on("spawn", () => {
     currentSession.connected = true;
@@ -339,34 +355,28 @@ async function startSession(uid, interaction, isReconnect = false) {
   });
 
   mc.on("error", (e) => {
-    // Pass null interaction for error handling
     if (!currentSession.manualStop) handleAutoReconnect(uid); 
     logToDiscord(`❌ Bot of <@${uid}> error: \`${e.message}\``);
   });
 
   mc.on("close", () => {
-    // Pass null interaction for close handling
     if (!currentSession.manualStop) handleAutoReconnect(uid);
     logToDiscord(`🔌 Bot of <@${uid}> connection closed.`);
   });
 }
 
-// FIXED AUTO RECONNECT
 function handleAutoReconnect(uid) {
     const s = sessions.get(uid);
-    // If session doesn't exist, or stopped manually, or already waiting to reconnect, ignore.
     if (!s || s.manualStop || s.reconnectTimer) return;
     
     s.isReconnecting = true;
     logToDiscord(`⏳ Bot of <@${uid}> disconnected. Reconnecting in 2 minutes...`);
 
     s.reconnectTimer = setTimeout(() => {
-        // Check if session still exists and wasn't manually stopped in the meantime
         if (sessions.has(uid)) {
             const checkS = sessions.get(uid);
             if (!checkS.manualStop) {
                 checkS.reconnectTimer = null;
-                // FIX 2 & 3: Pass null for interaction, and true for isReconnect
                 startSession(uid, null, true);
             } else {
                 cleanupSession(uid);
@@ -418,7 +428,7 @@ client.on(Events.InteractionCreate, async (i) => {
 
         const embed = new EmbedBuilder()
           .setTitle("⚙️ Java Compatibility Check")
-          .setDescription("For a successful connection to a Java server, ensure the following plugins are installed. If you haven't installed these, it's not gonna work.")
+          .setDescription("For a successful connection to a Java server, ensure the following plugins are installed.")
           .addFields(
               { name: "Required Plugins", value: "• GeyserMC\n• Floodgate\n• ViaVersion\n• ViaBackwards" }
           )
@@ -433,7 +443,6 @@ client.on(Events.InteractionCreate, async (i) => {
 
       if (i.customId === "confirm_start") {
           await i.deferUpdate();
-          // Normal start, isReconnect = false
           return startSession(uid, i, false);
       }
 
@@ -460,7 +469,7 @@ client.on(Events.InteractionCreate, async (i) => {
         modal.addComponents(
           new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("ip").setLabel("Server IP").setStyle(TextInputStyle.Short).setRequired(true).setValue(u.server?.ip || "")),
           new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("port").setLabel("Port").setStyle(TextInputStyle.Short).setRequired(true).setValue(String(u.server?.port || 19132))),
-          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("offline").setLabel("Offline Username (Discontinued, Not usable)").setStyle(TextInputStyle.Short).setRequired(false).setValue(u.offlineUsername || ""))
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("offline").setLabel("Offline Username (Discontinued)").setStyle(TextInputStyle.Short).setRequired(false).setValue(u.offlineUsername || ""))
         );
         return i.showModal(modal);
       }
