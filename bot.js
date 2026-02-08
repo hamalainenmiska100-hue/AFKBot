@@ -18,7 +18,7 @@ const { Authflow, Titles } = require("prismarine-auth");
 const fs = require("fs");
 const path = require("path");
 
-// --- NEW DEPENDENCIES FOR PHYSICS & GRAVITY ---
+// --- DEPENDENCIES FOR PHYSICS & GRAVITY ---
 let Vec3, PrismarineChunk, PrismarineRegistry, MinecraftData;
 try {
   Vec3 = require("vec3");
@@ -383,7 +383,15 @@ async function startSession(uid, interaction, isReconnect = false) {
 
   // --- CLIENT SETUP ---
   const authDir = getUserAuthDir(uid);
-  const opts = { host: ip, port: parseInt(port), connectTimeout: 60000, keepAlive: true };
+  
+  // OPTIMIZATION: Small view distance to save RAM
+  const opts = { 
+      host: ip, 
+      port: parseInt(port), 
+      connectTimeout: 60000, 
+      keepAlive: true,
+      viewDistance: 6 
+  };
 
   if (u.connectionType === "offline") {
     opts.username = u.offlineUsername || `AFK_${uid.slice(-4)}`;
@@ -404,7 +412,8 @@ async function startSession(uid, interaction, isReconnect = false) {
       connected: false,
       isReconnecting: false,
       // Physics Data
-      position: (Vec3) ? new Vec3(0, 0, 0) : null,
+      // IMPORTANT: Initialize as null so we know we aren't spawned yet
+      position: null,
       velocity: (Vec3) ? new Vec3(0, 0, 0) : null,
       yaw: 0,
       pitch: 0,
@@ -427,14 +436,7 @@ async function startSession(uid, interaction, isReconnect = false) {
           if (!currentSession.connected) return;
           const ccKey = `${packet.x},${packet.z}`;
           try {
-             // We need a Registry to parse chunks. Bedrock version matching is hard, defaulting to generic.
-             const registry = PrismarineRegistry('bedrock_1.19.0'); // Approx version
-             const Chunk = PrismarineChunk(registry);
-             const chunk = new Chunk();
-             // Bedrock payload parsing is complex; often just storing raw payload is enough if we use bedrock-provider
-             // For this simplified bot, we just mark that we received data.
-             // REAL IMPLEMENTATION OF BEDROCK CHUNK PARSING IS VERY HEAVY.
-             // We will simulate "Ground Awareness" by just assuming ground exists if we got a chunk packet for our coord.
+             // We just mark that we received data for ground checking
              currentSession.chunks.set(ccKey, { timestamp: Date.now(), x: packet.x, z: packet.z });
           } catch (e) { }
       });
@@ -442,6 +444,11 @@ async function startSession(uid, interaction, isReconnect = false) {
       // 2. Garbage Collect Chunks (RAM Saver)
       currentSession.chunkGCLoop = setInterval(() => {
           const now = Date.now();
+          // RAM PROTECTION: If we have too many chunks, clear them all
+          if (currentSession.chunks.size > 50) {
+              currentSession.chunks.clear();
+              return;
+          }
           for (const [key, data] of currentSession.chunks) {
               // Delete chunks older than 5 seconds
               if (now - data.timestamp > 5000) {
@@ -452,18 +459,12 @@ async function startSession(uid, interaction, isReconnect = false) {
 
       // 3. Gravity / Physics Loop (20 TPS)
       currentSession.physicsLoop = setInterval(() => {
+          // CRITICAL FIX: Do not run physics if we haven't received spawn coordinates yet.
+          // This prevents "SizeOf error for undefined".
           if (!currentSession.connected || !currentSession.position) return;
           
           // Basic Gravity
           const gravity = 0.05; 
-          
-          // Check if chunk exists below us
-          // Note: Since proper Bedrock chunk parsing is huge, we use a heuristic:
-          // If we haven't received the chunk we are standing in, we freeze.
-          // If we HAVE, we assume solid ground at Y=current unless we have block data.
-          // For this specific request "fall when block removed", we need actual block data.
-          // Since bedrock-protocol doesn't give easy block access without massive deps, 
-          // we will rely on SERVER corrections for falling, but send packets allowing it.
           
           // Apply Velocity
           currentSession.velocity.y -= gravity;
@@ -473,23 +474,28 @@ async function startSession(uid, interaction, isReconnect = false) {
 
           // Terminate velocity if we hit "bottom" (void) to prevent infinite falling
           if (currentSession.position.y < -64) {
-             currentSession.position.y = 100; // Respawn / Rubberband
+             currentSession.position.y = 100; // Rubberband up
              currentSession.velocity.y = 0;
           }
 
           // SEND POSITION
-          mc.write("player_auth_input", {
-             pitch: currentSession.pitch,
-             yaw: currentSession.yaw,
-             position: { x: currentSession.position.x, y: currentSession.position.y, z: currentSession.position.z },
-             move_vector: { x: 0, z: 0 },
-             head_yaw: currentSession.yaw,
-             input_data: 0n,
-             input_mode: "mouse",
-             play_mode: "screen",
-             interaction_model: "touch",
-             tick: 0n
-          });
+          // This packet is what keeps the connection alive and the bot falling
+          try {
+              mc.write("player_auth_input", {
+                 pitch: currentSession.pitch,
+                 yaw: currentSession.yaw,
+                 position: { x: currentSession.position.x, y: currentSession.position.y, z: currentSession.position.z },
+                 move_vector: { x: 0, z: 0 },
+                 head_yaw: currentSession.yaw,
+                 input_data: 0n,
+                 input_mode: "mouse",
+                 play_mode: "screen",
+                 interaction_model: "touch",
+                 tick: 0n
+              });
+          } catch (e) {
+              // Ignore serialization errors to prevent crashes
+          }
 
       }, 50); // 20 times a second
   }
@@ -500,15 +506,19 @@ async function startSession(uid, interaction, isReconnect = false) {
   const performAntiAfk = () => {
       if (!sessions.has(uid)) return;
       const s = sessions.get(uid);
-      if (!s.connected) return;
+      
+      // CRITICAL FIX: Guard clause here too
+      if (!s.connected || !s.position) {
+          // Retry slightly later if not spawned
+          s.afkTimeout = setTimeout(performAntiAfk, 5000);
+          return;
+      }
 
       try {
           // Randomize look direction slightly
           s.yaw += (Math.random() - 0.5) * 10; 
           s.pitch += (Math.random() - 0.5) * 5;
 
-          // Occasionally "jump" (send high position packet or input flag)
-          // 8n is jump flag
           const shouldJump = Math.random() > 0.7;
           
           mc.write("player_auth_input", {
@@ -524,9 +534,9 @@ async function startSession(uid, interaction, isReconnect = false) {
             tick: 0n
           });
           
-          // Swing Arm (Animation)
+          // Swing Arm
           mc.write('animate', {
-             action_id: 1, // Swing arm
+             action_id: 1, 
              runtime_entity_id: s.entityId || 0n
           });
 
@@ -540,28 +550,23 @@ async function startSession(uid, interaction, isReconnect = false) {
 
   // --- EVENTS ---
   mc.on("spawn", () => {
-    currentSession.connected = true;
-    currentSession.isReconnecting = false;
-    
-    // Initialize Position from spawn
-    if (currentSession.position) {
-        // We usually don't get exact coords on spawn event in bedrock-protocol easily
-        // We default to 0, 100, 0 until a packet updates us
-        // Listen for "start_game" or "respawn" for real coords
-    }
-    
+    // IMPORTANT: Wait for start_game packet before setting connected=true fully for physics
     if (!isReconnect) safeReply(interaction, `🟢 **Connected** to **${ip}:${port}**`);
     logToDiscord(`✅ Bot of <@${uid}> spawned on **${ip}:${port}**` + (isReconnect ? " (Auto-Rejoined)" : ""));
-    
-    // Start Anti-AFK
-    performAntiAfk();
   });
 
+  // Use start_game to get the initial coordinates safely
   mc.on("start_game", (packet) => {
-      if (currentSession.position) {
-          currentSession.position.set(packet.player_position.x, packet.player_position.y, packet.player_position.z);
-          currentSession.entityId = packet.runtime_entity_id;
+      // This is the source of truth for where we are
+      if (Vec3) {
+          currentSession.position = new Vec3(packet.player_position.x, packet.player_position.y, packet.player_position.z);
       }
+      currentSession.entityId = packet.runtime_entity_id;
+      currentSession.connected = true;
+      currentSession.isReconnecting = false;
+      
+      // Start Anti-AFK now that we have position
+      performAntiAfk();
   });
   
   // Update position if server teleports us
