@@ -142,11 +142,13 @@ function panelRow(isJava = false) {
 
 function adminPanelComponents() {
   const rows = [
+    // Row 1: Main Controls
     new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId("admin_refresh").setLabel("🔄 Refresh").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("admin_reconnect_all").setLabel("♻️ Reconnect All").setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId("admin_stop_all").setLabel("🛑 Stop All").setStyle(ButtonStyle.Danger)
     ),
+    // Row 2: Fun/Control
     new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId("admin_chat_all").setLabel("📢 Chat (All)").setStyle(ButtonStyle.Success)
     )
@@ -264,19 +266,23 @@ async function linkMicrosoft(uid, interaction) {
 function cleanupSession(uid) {
   const s = sessions.get(uid);
   if (!s) return;
+  
   if (s.reconnectTimer) clearTimeout(s.reconnectTimer);
   if (s.physicsLoop) clearInterval(s.physicsLoop);
   if (s.afkTimeout) clearTimeout(s.afkTimeout);
+
   try { s.client.close(); } catch {}
   sessions.delete(uid);
 }
 
 function stopSession(uid) {
   const s = sessions.get(uid);
+  
   if (activeSessionsStore[uid]) {
       delete activeSessionsStore[uid];
       saveActiveSessions();
   }
+
   if (!s) return false;
   s.manualStop = true; 
   cleanupSession(uid);
@@ -286,6 +292,7 @@ function stopSession(uid) {
 function handleAutoReconnect(uid) {
     const s = sessions.get(uid);
     if (!s || s.manualStop) return;
+    
     if (s.reconnectTimer) clearTimeout(s.reconnectTimer);
     
     s.isReconnecting = true;
@@ -304,7 +311,6 @@ function handleAutoReconnect(uid) {
     }, 60000);
 }
 
-// Safe reply now handles deferring
 async function safeReply(interaction, content) {
     if (!interaction) return;
     try {
@@ -335,6 +341,11 @@ async function startSession(uid, interaction, isReconnect = false) {
       return safeReply(interaction, "⚠️ **Session Conflict**: Active session already exists.").catch(() => {});
   }
   
+  // --- SKIP PING LOGIC ---
+  const SKIP_PING_DOMAINS = ['.progamer.me', '.playserver.pro', '.freeservers.cloud'];
+  const shouldSkipPing = SKIP_PING_DOMAINS.some(domain => ip.toLowerCase().endsWith(domain));
+
+  // --- UI: Compact Embed ---
   const connectionEmbed = new EmbedBuilder()
     .setColor("#5865F2")
     .setTitle("Bot Initialization")
@@ -343,17 +354,25 @@ async function startSession(uid, interaction, isReconnect = false) {
   // --- STEP 1: PING (BLOCKING CHECK) ---
   try {
       if (!isReconnect) {
-          connectionEmbed.setDescription(`🔍 **Pinging server...**\n🌐 **Target:** \`${ip}:${port}\``);
+          if (shouldSkipPing) {
+              connectionEmbed.setDescription(`⏩ **Skipping Ping (Known Host)**\n🌐 **Target:** \`${ip}:${port}\``);
+          } else {
+              connectionEmbed.setDescription(`🔍 **Pinging server...**\n🌐 **Target:** \`${ip}:${port}\``);
+          }
           await safeReply(interaction, { embeds: [connectionEmbed], content: null, components: [] });
       }
       
       const preAuth = new Authflow(uid, getUserAuthDir(uid), { flow: "live", authTitle: Titles?.MinecraftNintendoSwitch, deviceType: "Nintendo" });
       try { await preAuth.getXboxToken(); } catch (e) {}
 
-      await bedrock.ping({ host: ip, port: parseInt(port) || 19132, timeout: 5000 });
+      // Perform ping only if NOT skipped
+      if (!shouldSkipPing) {
+          await bedrock.ping({ host: ip, port: parseInt(port) || 19132, timeout: 5000 });
+      }
       
       if (!isReconnect) {
-          connectionEmbed.setDescription(`✅ **Server Online! Connecting...**\n🌐 **Target:** \`${ip}:${port}\``);
+          const statusText = shouldSkipPing ? "Attempting connection..." : "Server Online! Connecting...";
+          connectionEmbed.setDescription(`✅ **${statusText}**\n🌐 **Target:** \`${ip}:${port}\``);
           await safeReply(interaction, { embeds: [connectionEmbed] });
       }
   } catch (err) {
@@ -479,10 +498,9 @@ client.on(Events.InteractionCreate, async (i) => {
 
     if (i.isButton()) {
       // --- IMPORTANT: LAG FIX (Immediate Acknowledgment) ---
-      // We defer/reply immediately to stop Discord showing "Interaction Failed" error
       
       if (i.customId === "admin_refresh") {
-        await i.deferUpdate(); // Stop timeout immediately
+        await i.deferUpdate(); 
         return i.editReply({ embeds: [getAdminStatsEmbed()], components: adminPanelComponents() }).catch(() => {});
       }
       
@@ -499,12 +517,12 @@ client.on(Events.InteractionCreate, async (i) => {
       }
 
       if (i.customId === "confirm_start") {
-          await i.deferUpdate(); // Prevent red error
+          await i.deferUpdate(); 
           return startSession(uid, i, false);
       }
 
       if (i.customId === "stop") {
-        await i.deferReply({ ephemeral: true }); // Prevent red error
+        await i.deferReply({ ephemeral: true }); 
         const ok = stopSession(uid);
         return i.editReply({ content: ok ? "⏹ **Session Terminated.**" : "No active sessions." });
       }
@@ -520,7 +538,6 @@ client.on(Events.InteractionCreate, async (i) => {
         return i.editReply({ content: "🗑 Unlinked." });
       }
 
-      // Simple replies
       if (i.customId === "cancel") return i.update({ content: "❌ Cancelled.", embeds: [], components: [] });
       if (i.customId === "settings") {
         const u = getUser(uid);
@@ -532,7 +549,6 @@ client.on(Events.InteractionCreate, async (i) => {
         return i.showModal(modal);
       }
       
-      // Admin buttons
       if (i.customId === "admin_stop_all") {
         await i.deferReply({ ephemeral: true });
         sessions.forEach((s, id) => stopSession(id));
@@ -553,7 +569,7 @@ client.on(Events.InteractionCreate, async (i) => {
 
     if (i.isModalSubmit()) {
         if (i.customId === "settings_modal") {
-            await i.deferReply({ ephemeral: true }); // Lag fix
+            await i.deferReply({ ephemeral: true }); 
             const ip = i.fields.getTextInputValue("ip").trim();
             const port = parseInt(i.fields.getTextInputValue("port").trim(), 10);
             const u = getUser(uid);
