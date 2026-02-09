@@ -142,13 +142,11 @@ function panelRow(isJava = false) {
 
 function adminPanelComponents() {
   const rows = [
-    // Row 1: Main Controls
     new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId("admin_refresh").setLabel("🔄 Refresh").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("admin_reconnect_all").setLabel("♻️ Reconnect All").setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId("admin_stop_all").setLabel("🛑 Stop All").setStyle(ButtonStyle.Danger)
     ),
-    // Row 2: Fun/Control
     new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId("admin_chat_all").setLabel("📢 Chat (All)").setStyle(ButtonStyle.Success)
     )
@@ -266,23 +264,19 @@ async function linkMicrosoft(uid, interaction) {
 function cleanupSession(uid) {
   const s = sessions.get(uid);
   if (!s) return;
-  
   if (s.reconnectTimer) clearTimeout(s.reconnectTimer);
   if (s.physicsLoop) clearInterval(s.physicsLoop);
   if (s.afkTimeout) clearTimeout(s.afkTimeout);
-
   try { s.client.close(); } catch {}
   sessions.delete(uid);
 }
 
 function stopSession(uid) {
   const s = sessions.get(uid);
-  
   if (activeSessionsStore[uid]) {
       delete activeSessionsStore[uid];
       saveActiveSessions();
   }
-
   if (!s) return false;
   s.manualStop = true; 
   cleanupSession(uid);
@@ -292,7 +286,6 @@ function stopSession(uid) {
 function handleAutoReconnect(uid) {
     const s = sessions.get(uid);
     if (!s || s.manualStop) return;
-    
     if (s.reconnectTimer) clearTimeout(s.reconnectTimer);
     
     s.isReconnecting = true;
@@ -311,6 +304,7 @@ function handleAutoReconnect(uid) {
     }, 60000);
 }
 
+// Safe reply now handles deferring
 async function safeReply(interaction, content) {
     if (!interaction) return;
     try {
@@ -341,40 +335,25 @@ async function startSession(uid, interaction, isReconnect = false) {
       return safeReply(interaction, "⚠️ **Session Conflict**: Active session already exists.").catch(() => {});
   }
   
-  // --- UI: Compact Embed ---
   const connectionEmbed = new EmbedBuilder()
     .setColor("#5865F2")
     .setTitle("Bot Initialization")
     .setThumbnail("https://files.catbox.moe/9mqpoz.gif");
 
-  // 1. Show "Connecting" UI immediately
-  if (!isReconnect) {
-      connectionEmbed.setDescription(`🚀 **Connecting to server...**\n🌐 **Target:** \`${ip}:${port}\``);
-      await safeReply(interaction, { embeds: [connectionEmbed], content: null, components: [] });
-  }
-
-  const authDir = getUserAuthDir(uid);
-
-  // --- NEW: Token Pre-load (Speeds up connection) ---
-  try {
-      const preAuth = new Authflow(uid, authDir, { flow: "live", authTitle: Titles?.MinecraftNintendoSwitch, deviceType: "Nintendo" });
-      await preAuth.getXboxToken(); // Warm up cache
-  } catch (e) {
-      // Ignore pre-load errors, allow createClient to handle it
-  }
-
   // --- STEP 1: PING (BLOCKING CHECK) ---
   try {
       if (!isReconnect) {
           connectionEmbed.setDescription(`🔍 **Pinging server...**\n🌐 **Target:** \`${ip}:${port}\``);
-          await safeReply(interaction, { embeds: [connectionEmbed] });
+          await safeReply(interaction, { embeds: [connectionEmbed], content: null, components: [] });
       }
       
-      // Wait for ping to finish. If fails, we stop.
+      const preAuth = new Authflow(uid, getUserAuthDir(uid), { flow: "live", authTitle: Titles?.MinecraftNintendoSwitch, deviceType: "Nintendo" });
+      try { await preAuth.getXboxToken(); } catch (e) {}
+
       await bedrock.ping({ host: ip, port: parseInt(port) || 19132, timeout: 5000 });
       
       if (!isReconnect) {
-          connectionEmbed.setDescription(`✅ **Server Online! Authenticating...**\n🌐 **Target:** \`${ip}:${port}\``);
+          connectionEmbed.setDescription(`✅ **Server Online! Connecting...**\n🌐 **Target:** \`${ip}:${port}\``);
           await safeReply(interaction, { embeds: [connectionEmbed] });
       }
   } catch (err) {
@@ -382,7 +361,6 @@ async function startSession(uid, interaction, isReconnect = false) {
       if (isReconnect) {
           handleAutoReconnect(uid); 
       } else {
-          // --- FIX: Remove GIF on fail ---
           connectionEmbed.setDescription(`❌ **Connection Failed**\nThe server at \`${ip}:${port}\` is offline or unreachable.`);
           connectionEmbed.setThumbnail(null);
           await safeReply(interaction, { embeds: [connectionEmbed] });
@@ -393,15 +371,11 @@ async function startSession(uid, interaction, isReconnect = false) {
   }
 
   // --- STEP 2: CONNECT ---
+  const authDir = getUserAuthDir(uid);
+  
   const opts = { 
-      host: ip, 
-      port: parseInt(port), 
-      connectTimeout: 60000, 
-      keepAlive: true,
-      viewDistance: 4, 
-      profilesFolder: authDir,
-      username: uid,
-      offline: false
+      host: ip, port: parseInt(port), connectTimeout: 60000, keepAlive: true,
+      viewDistance: 4, profilesFolder: authDir, username: uid, offline: false
   };
 
   if (u.connectionType === "offline") {
@@ -412,96 +386,48 @@ async function startSession(uid, interaction, isReconnect = false) {
   const mc = bedrock.createClient(opts);
   
   const currentSession = { 
-      client: mc, 
-      startedAt: Date.now(), 
-      manualStop: false, 
-      connected: false,
-      isReconnecting: false,
-      position: null,
-      velocity: (Vec3) ? new Vec3(0, 0, 0) : null,
-      yaw: 0,
-      pitch: 0,
-      onGround: false,
-      reconnectTimer: null,
-      physicsLoop: null,
-      afkTimeout: null,
+      client: mc, startedAt: Date.now(), manualStop: false, connected: false,
+      isReconnecting: false, position: null, velocity: (Vec3) ? new Vec3(0, 0, 0) : null,
+      yaw: 0, pitch: 0, onGround: false, reconnectTimer: null, physicsLoop: null, afkTimeout: null,
   };
   sessions.set(uid, currentSession);
 
-  // ==========================================
-  // 🍎 PHYSICS ENGINE (Gravity & Hand Swing Only)
-  // ==========================================
+  // PHYSICS (Gravity Only)
   if (Vec3) {
       currentSession.physicsLoop = setInterval(() => {
           if (!currentSession.connected || !currentSession.position) return;
-          
           const gravity = 0.08; 
-          
-          // Apply Gravity
-          if (!currentSession.onGround) {
-             currentSession.velocity.y -= gravity;
-          }
-
+          if (!currentSession.onGround) currentSession.velocity.y -= gravity;
           if (currentSession.velocity.y < -3.92) currentSession.velocity.y = -3.92;
-          
           currentSession.position.add(currentSession.velocity);
-
-          // Void Protection
-          if (currentSession.position.y < -64) {
-             currentSession.position.y = 320; 
-             currentSession.velocity.y = 0;
-          }
-
-          // Send Packet
+          if (currentSession.position.y < -64) { currentSession.position.y = 320; currentSession.velocity.y = 0; }
           try {
               mc.write("player_auth_input", {
                  pitch: currentSession.pitch, yaw: currentSession.yaw,
                  position: { x: currentSession.position.x, y: currentSession.position.y, z: currentSession.position.z },
-                 move_vector: { x: 0, z: 0 }, 
-                 head_yaw: currentSession.yaw, input_data: 0n,
+                 move_vector: { x: 0, z: 0 }, head_yaw: currentSession.yaw, input_data: 0n,
                  input_mode: "mouse", play_mode: "screen", interaction_model: "touch", tick: 0n
               });
           } catch (e) {}
       }, 50); 
   }
 
-  // ==========================================
-  // 🤖 ANTI-AFK (Look, Jump, Swing)
-  // ==========================================
+  // ANTI-AFK
   const performAntiAfk = () => {
       if (!sessions.has(uid)) return;
       const s = sessions.get(uid);
-      
-      if (!s.connected || !s.position) {
-          s.afkTimeout = setTimeout(performAntiAfk, 5000);
-          return;
-      }
-
+      if (!s.connected || !s.position) { s.afkTimeout = setTimeout(performAntiAfk, 5000); return; }
       try {
-          // Randomize Look
-          s.yaw += (Math.random() - 0.5) * 20; 
-          s.pitch += (Math.random() - 0.5) * 10;
-
-          // Random Jump (if on ground)
-          if (s.onGround && Math.random() > 0.9) {
-              s.velocity.y = 0.42;
-              s.onGround = false;
-          }
-          
-          // Hand Swing (Animation)
+          s.yaw += (Math.random() - 0.5) * 20; s.pitch += (Math.random() - 0.5) * 10;
+          if (s.onGround && Math.random() > 0.9) { s.velocity.y = 0.42; s.onGround = false; }
           mc.write('animate', { action_id: 1, runtime_entity_id: s.entityId || 0n });
       } catch (e) {}
-
-      const nextDelay = Math.random() * 20000 + 10000;
-      s.afkTimeout = setTimeout(performAntiAfk, nextDelay);
+      s.afkTimeout = setTimeout(performAntiAfk, Math.random() * 20000 + 10000);
   };
 
-  // --- EVENTS ---
   mc.on("spawn", () => {
     logToDiscord(`✅ Bot of <@${uid}> spawned on **${ip}:${port}**` + (isReconnect ? " (Auto-Rejoined)" : ""));
-    // Final Success Embed
     if (!isReconnect) {
-        // --- FIX: Remove GIF on success ---
         connectionEmbed.setDescription(`🟢 **Online** on \`${ip}:${port}\`\nPhysics & Hand Swing Active.`);
         connectionEmbed.setThumbnail(null); 
         safeReply(interaction, { embeds: [connectionEmbed] });
@@ -509,45 +435,28 @@ async function startSession(uid, interaction, isReconnect = false) {
   });
 
   mc.on("start_game", (packet) => {
-      if (Vec3) {
-          currentSession.position = new Vec3(packet.player_position.x, packet.player_position.y, packet.player_position.z);
-      }
+      if (Vec3) { currentSession.position = new Vec3(packet.player_position.x, packet.player_position.y, packet.player_position.z); }
       currentSession.entityId = packet.runtime_entity_id;
       currentSession.connected = true;
       currentSession.isReconnecting = false;
-      
       performAntiAfk();
   });
   
   mc.on("move_player", (packet) => {
       if (packet.runtime_id === currentSession.entityId && currentSession.position) {
-          if (packet.position.y > currentSession.position.y) {
-              currentSession.onGround = true;
-              currentSession.velocity.y = 0;
-          } else {
-              currentSession.onGround = false;
-          }
+          if (packet.position.y > currentSession.position.y) { currentSession.onGround = true; currentSession.velocity.y = 0; } 
+          else { currentSession.onGround = false; }
           currentSession.position.set(packet.position.x, packet.position.y, packet.position.z);
       }
   });
   
   mc.on("respawn", (packet) => {
       logToDiscord(`💀 Bot of <@${uid}> died and respawned.`);
-      if (currentSession.position) {
-          currentSession.position.set(packet.position.x, packet.position.y, packet.position.z);
-          currentSession.velocity.set(0,0,0);
-      }
+      if (currentSession.position) { currentSession.position.set(packet.position.x, packet.position.y, packet.position.z); currentSession.velocity.set(0,0,0); }
   });
 
-  mc.on("error", (e) => {
-    if (!currentSession.manualStop) handleAutoReconnect(uid); 
-    logToDiscord(`❌ Bot of <@${uid}> error: \`${e.message}\``);
-  });
-
-  mc.on("close", () => {
-    if (!currentSession.manualStop) handleAutoReconnect(uid);
-    logToDiscord(`🔌 Bot of <@${uid}> connection closed.`);
-  });
+  mc.on("error", (e) => { if (!currentSession.manualStop) handleAutoReconnect(uid); logToDiscord(`❌ Bot of <@${uid}> error: \`${e.message}\``); });
+  mc.on("close", () => { if (!currentSession.manualStop) handleAutoReconnect(uid); logToDiscord(`🔌 Bot of <@${uid}> connection closed.`); });
 }
 
 // ----------------- Interactions -----------------
@@ -561,7 +470,7 @@ client.on(Events.InteractionCreate, async (i) => {
       if (i.commandName === "panel") return safeReply(i, panelRow(false));
       if (i.commandName === "java") return safeReply(i, panelRow(true));
       if (i.commandName === "admin") {
-        if (uid !== ADMIN_ID || i.channelId !== ADMIN_CHANNEL_ID) return safeReply(i, { content: "⛔ Access restricted.", ephemeral: true });
+        if (uid !== ADMIN_ID) return i.reply({ content: "⛔ Access restricted.", ephemeral: true });
         const msg = await i.reply({ embeds: [getAdminStatsEmbed()], components: adminPanelComponents(), fetchReply: true });
         lastAdminMessage = msg;
         return;
@@ -569,81 +478,50 @@ client.on(Events.InteractionCreate, async (i) => {
     }
 
     if (i.isButton()) {
-      // --- ADMIN CONTROLS ---
+      // --- IMPORTANT: LAG FIX (Immediate Acknowledgment) ---
+      // We defer/reply immediately to stop Discord showing "Interaction Failed" error
+      
       if (i.customId === "admin_refresh") {
-        return i.update({ embeds: [getAdminStatsEmbed()], components: adminPanelComponents() }).catch(() => {});
+        await i.deferUpdate(); // Stop timeout immediately
+        return i.editReply({ embeds: [getAdminStatsEmbed()], components: adminPanelComponents() }).catch(() => {});
       }
       
-      if (i.customId === "admin_stop_all") {
-        sessions.forEach((s, id) => stopSession(id));
-        return i.reply({ content: "🛑 All sessions stopped.", ephemeral: true });
-      }
-
-      if (i.customId === "admin_reconnect_all") {
-        i.reply({ content: "♻️ Reconnecting all bots...", ephemeral: true });
-        const ids = Array.from(sessions.keys());
-        ids.forEach(id => {
-            stopSession(id);
-            setTimeout(() => startSession(id, null, true), 3000); 
-        });
-        return;
-      }
-
-      if (i.customId === "admin_chat_all") {
-          const modal = new ModalBuilder().setCustomId("admin_chat_modal").setTitle("Broadcast Message");
-          modal.addComponents(new ActionRowBuilder().addComponents(
-              new TextInputBuilder().setCustomId("msg").setLabel("Message").setStyle(TextInputStyle.Short)
-          ));
-          return i.showModal(modal);
-      }
-
-      // --- USER CONTROLS ---
-      if (i.customId === "start_bedrock") {
-        if (sessions.has(uid)) return safeReply(i, { ephemeral: true, content: "⚠️ **Session Conflict**: Active session exists." });
-        const embed = new EmbedBuilder().setTitle("Bedrock Connection").setDescription("Start bot?").setColor("#2ECC71");
-        const row = new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId("confirm_start").setLabel("Start").setStyle(ButtonStyle.Success),
+      if (i.customId === "start_bedrock" || i.customId === "start_java") {
+         const embed = new EmbedBuilder().setTitle(i.customId.includes('java') ? "Java Check" : "Bedrock Connection").setColor("#2ECC71");
+         if (i.customId === "start_java") embed.setDescription("Ensure GeyserMC is installed.").addFields({ name: "Plugins", value: "GeyserMC & Floodgate" });
+         else embed.setDescription("Start bot?");
+         
+         const row = new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId("confirm_start").setLabel("Confirm").setStyle(ButtonStyle.Success),
             new ButtonBuilder().setCustomId("cancel").setLabel("Cancel").setStyle(ButtonStyle.Secondary)
         );
-        return i.reply({ embeds: [embed], components: [row], ephemeral: true }).catch(() => {});
-      }
-
-      if (i.customId === "start_java") {
-        if (sessions.has(uid)) return safeReply(i, { ephemeral: true, content: "⚠️ **Session Conflict**: Active session exists." });
-        const embed = new EmbedBuilder()
-          .setTitle("⚙️ Java Compatibility Check")
-          .setDescription("For a successful connection to a Java server, ensure the following plugins are installed.")
-          .addFields( { name: "Required Plugins", value: "• GeyserMC\n• Floodgate" } )
-          .setColor("#E67E22");
-        const row = new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId("confirm_start").setLabel("Confirm & Start").setStyle(ButtonStyle.Success),
-            new ButtonBuilder().setCustomId("cancel").setLabel("Cancel").setStyle(ButtonStyle.Secondary)
-        );
-        return i.reply({ embeds: [embed], components: [row], ephemeral: true }).catch(() => {});
+        return i.reply({ embeds: [embed], components: [row], ephemeral: true });
       }
 
       if (i.customId === "confirm_start") {
-          await i.deferUpdate().catch(() => {});
+          await i.deferUpdate(); // Prevent red error
           return startSession(uid, i, false);
       }
 
-      if (i.customId === "cancel") return i.update({ content: "❌ Cancelled.", embeds: [], components: [] }).catch(() => {});
-      
       if (i.customId === "stop") {
+        await i.deferReply({ ephemeral: true }); // Prevent red error
         const ok = stopSession(uid);
-        return safeReply(i, { ephemeral: true, content: ok ? "⏹ **Session Terminated.**" : "No active sessions." });
+        return i.editReply({ content: ok ? "⏹ **Session Terminated.**" : "No active sessions." });
       }
 
       if (i.customId === "link") {
-          await i.deferReply({ ephemeral: true }).catch(() => {});
+          await i.deferReply({ ephemeral: true });
           return linkMicrosoft(uid, i);
       }
 
       if (i.customId === "unlink") {
+        await i.deferReply({ ephemeral: true });
         unlinkMicrosoft(uid);
-        return safeReply(i, { ephemeral: true, content: "🗑 Unlinked." });
+        return i.editReply({ content: "🗑 Unlinked." });
       }
 
+      // Simple replies
+      if (i.customId === "cancel") return i.update({ content: "❌ Cancelled.", embeds: [], components: [] });
       if (i.customId === "settings") {
         const u = getUser(uid);
         const modal = new ModalBuilder().setCustomId("settings_modal").setTitle("Configuration");
@@ -653,42 +531,45 @@ client.on(Events.InteractionCreate, async (i) => {
         );
         return i.showModal(modal);
       }
+      
+      // Admin buttons
+      if (i.customId === "admin_stop_all") {
+        await i.deferReply({ ephemeral: true });
+        sessions.forEach((s, id) => stopSession(id));
+        return i.editReply("🛑 All sessions stopped.");
+      }
+      if (i.customId === "admin_reconnect_all") {
+        await i.reply({ content: "♻️ Reconnecting all...", ephemeral: true });
+        const ids = Array.from(sessions.keys());
+        ids.forEach(id => { stopSession(id); setTimeout(() => startSession(id, null, true), 3000); });
+        return;
+      }
+      if (i.customId === "admin_chat_all") {
+          const modal = new ModalBuilder().setCustomId("admin_chat_modal").setTitle("Broadcast Message");
+          modal.addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("msg").setLabel("Message").setStyle(TextInputStyle.Short)));
+          return i.showModal(modal);
+      }
     }
 
-    // --- MODAL SUBMITS ---
     if (i.isModalSubmit()) {
         if (i.customId === "settings_modal") {
+            await i.deferReply({ ephemeral: true }); // Lag fix
             const ip = i.fields.getTextInputValue("ip").trim();
             const port = parseInt(i.fields.getTextInputValue("port").trim(), 10);
             const u = getUser(uid);
             u.server = { ip, port };
             save();
-            return safeReply(i, { ephemeral: true, content: `✅ Saved: **${ip}:${port}**` });
+            return i.editReply(`✅ Saved: **${ip}:${port}**`);
         }
-        
-        // --- FIXED CHAT (ALL) LOGIC ---
         if (i.customId === "admin_chat_modal") {
             const msg = i.fields.getTextInputValue("msg");
             let sentCount = 0;
-            
-            // Loop through all sessions to find valid clients
             for (const [id, session] of sessions) {
                 if (session.client) {
-                    try { 
-                        session.client.queue('text', { 
-                            type: 'chat', 
-                            needs_translation: false, 
-                            source_name: session.client.username, 
-                            xuid: '', 
-                            message: msg 
-                        }); 
-                        sentCount++; 
-                    } catch (e) {
-                        console.error(`Failed to send chat to ${id}:`, e.message);
-                    }
+                    try { session.client.queue('text', { type: 'chat', needs_translation: false, source_name: session.client.username, xuid: '', message: msg }); sentCount++; } catch (e) {}
                 }
             }
-            return i.reply({ content: `📢 Broadcast sent to ${sentCount} active bots.`, ephemeral: true });
+            return i.reply({ content: `📢 Sent to ${sentCount} bots.`, ephemeral: true });
         }
     }
 
@@ -699,19 +580,11 @@ client.on(Events.InteractionCreate, async (i) => {
 client.on(Events.MessageCreate, async (message) => {
     if (message.author.bot) return;
     if (message.channel.id !== '1462398161074000143') return;
-    
     const content = message.content.toLowerCase();
-    const triggerWords = ['afk', 'afkbot'];
-
-    if (triggerWords.some(word => content.includes(word))) {
+    if (['afk', 'afkbot'].some(w => content.includes(w))) {
         try {
             const reaction = await message.react('<a:loading:1470137639339299053>');
-            setTimeout(async () => {
-                try {
-                    await reaction.remove();
-                    await message.reply("What bout me? 😁");
-                } catch (e) {}
-            }, 3000);
+            setTimeout(async () => { try { await reaction.remove(); await message.reply("What bout me? 😁"); } catch (e) {} }, 3000);
         } catch (e) {}
     }
 });
