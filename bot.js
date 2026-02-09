@@ -148,7 +148,7 @@ function adminPanelComponents() {
       new ButtonBuilder().setCustomId("admin_reconnect_all").setLabel("♻️ Reconnect All").setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId("admin_stop_all").setLabel("🛑 Stop All").setStyle(ButtonStyle.Danger)
     ),
-    // Row 2: Fun/Control (Removed Jump, Kept Chat)
+    // Row 2: Fun/Control
     new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId("admin_chat_all").setLabel("📢 Chat (All)").setStyle(ButtonStyle.Success)
     )
@@ -347,38 +347,52 @@ async function startSession(uid, interaction, isReconnect = false) {
     .setTitle("Bot Initialization")
     .setThumbnail("https://files.catbox.moe/9mqpoz.gif");
 
+  // 1. Show "Connecting" UI immediately
+  if (!isReconnect) {
+      connectionEmbed.setDescription(`🚀 **Connecting to server...**\n🌐 **Target:** \`${ip}:${port}\``);
+      await safeReply(interaction, { embeds: [connectionEmbed], content: null, components: [] });
+  }
+
+  const authDir = getUserAuthDir(uid);
+
+  // --- NEW: Token Pre-load (Speeds up connection) ---
+  try {
+      const preAuth = new Authflow(uid, authDir, { flow: "live", authTitle: Titles?.MinecraftNintendoSwitch, deviceType: "Nintendo" });
+      await preAuth.getXboxToken(); // Warm up cache
+  } catch (e) {
+      // Ignore pre-load errors, allow createClient to handle it
+  }
+
   // --- STEP 1: PING (BLOCKING CHECK) ---
   try {
       if (!isReconnect) {
           connectionEmbed.setDescription(`🔍 **Pinging server...**\n🌐 **Target:** \`${ip}:${port}\``);
-          await safeReply(interaction, { embeds: [connectionEmbed], content: null, components: [] });
+          await safeReply(interaction, { embeds: [connectionEmbed] });
       }
       
       // Wait for ping to finish. If fails, we stop.
       await bedrock.ping({ host: ip, port: parseInt(port) || 19132, timeout: 5000 });
       
       if (!isReconnect) {
-          connectionEmbed.setDescription(`✅ **Server Online! Connecting...**\n🌐 **Target:** \`${ip}:${port}\``);
+          connectionEmbed.setDescription(`✅ **Server Online! Authenticating...**\n🌐 **Target:** \`${ip}:${port}\``);
           await safeReply(interaction, { embeds: [connectionEmbed] });
       }
   } catch (err) {
       logToDiscord(`❌ Connection failure for <@${uid}>: Server ${ip}:${port} unreachable.`);
       if (isReconnect) {
-          // If auto-reconnecting, we just wait and try later (infinite rejoin loop)
           handleAutoReconnect(uid); 
       } else {
-          // If user started manually, we stop and show error
+          // --- FIX: Remove GIF on fail ---
           connectionEmbed.setDescription(`❌ **Connection Failed**\nThe server at \`${ip}:${port}\` is offline or unreachable.`);
+          connectionEmbed.setThumbnail(null);
           await safeReply(interaction, { embeds: [connectionEmbed] });
           delete activeSessionsStore[uid];
           saveActiveSessions();
       }
-      return; // STOP HERE
+      return; 
   }
 
   // --- STEP 2: CONNECT ---
-  const authDir = getUserAuthDir(uid);
-  
   const opts = { 
       host: ip, 
       port: parseInt(port), 
@@ -487,7 +501,9 @@ async function startSession(uid, interaction, isReconnect = false) {
     logToDiscord(`✅ Bot of <@${uid}> spawned on **${ip}:${port}**` + (isReconnect ? " (Auto-Rejoined)" : ""));
     // Final Success Embed
     if (!isReconnect) {
+        // --- FIX: Remove GIF on success ---
         connectionEmbed.setDescription(`🟢 **Online** on \`${ip}:${port}\`\nPhysics & Hand Swing Active.`);
+        connectionEmbed.setThumbnail(null); 
         safeReply(interaction, { embeds: [connectionEmbed] });
     }
   });
