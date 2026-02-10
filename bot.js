@@ -39,7 +39,7 @@ if (!DISCORD_TOKEN) {
 }
 
 // ==========================================================
-// 🔥 FIREBASE CONFIGURATION (The "Backpack")
+// 🔥 FIREBASE CONFIGURATION
 // ==========================================================
 const serviceAccount = {
   "type": "service_account",
@@ -56,7 +56,7 @@ try {
     credential: admin.credential.cert(serviceAccount),
     databaseURL: DATABASE_URL
   });
-  console.log("🔥 Firebase initialized successfully.");
+  console.log("🔥 Firebase initialized.");
 } catch (e) {
   console.error("🔥 Firebase init failed:", e);
 }
@@ -68,7 +68,7 @@ const ADMIN_ID = "1144987924123881564";
 const LOG_CHANNEL_ID = "1464615030111731753";
 const ADMIN_CHANNEL_ID = "1469013237625393163"; 
 
-// ----------------- Storage Paths (Local cache for Authflow) -----------------
+// ----------------- Storage Paths -----------------
 const DATA = path.join(__dirname, "data");
 const AUTH_ROOT = path.join(DATA, "auth");
 if (!fs.existsSync(DATA)) fs.mkdirSync(DATA);
@@ -88,7 +88,6 @@ async function getUser(uid) {
     usersCache[uid] = u;
     return u;
   } catch (e) {
-    console.error("Firebase getUser error:", e);
     return { connectionType: "online", bedrockVersion: "auto" };
   }
 }
@@ -98,7 +97,6 @@ async function saveUser(uid, data) {
   try { await db.ref('users/' + uid).set(data); } catch (e) {}
 }
 
-// Downloads keys from Firebase to local folder so prismarine-auth can read them
 async function downloadAuth(uid) {
     try {
         const snap = await db.ref(`auth_files/${uid}`).once('value');
@@ -113,7 +111,6 @@ async function downloadAuth(uid) {
     } catch (e) { return false; }
 }
 
-// Uploads local keys to Firebase after login
 async function uploadAuth(uid) {
     try {
         const userDir = path.join(AUTH_ROOT, uid);
@@ -146,14 +143,14 @@ async function unlinkMicrosoft(uid) {
   await saveUser(uid, u);
 }
 
-// ----------------- Runtime -----------------
+// ----------------- Global State -----------------
 const sessions = new Map();
 const pendingLink = new Map();
 const lastMsa = new Map();
 let lastAdminMessage = null; 
 
 // ==========================================================
-// 👑 LEADER ELECTION SYSTEM (Allows 2 Machines)
+// 👑 LEADER ELECTION SYSTEM
 // ==========================================================
 const MACHINE_ID = Math.random().toString(36).substring(7);
 let IS_LEADER = false;
@@ -176,7 +173,6 @@ async function runLeaderElection() {
             const currentLeader = snapshot.val();
             const now = Date.now();
 
-            // Be leader if no leader exists or leader is dead (heartbeat > 15s)
             if (!currentLeader || (now - currentLeader.heartbeat > 15000)) {
                 await leaderRef.set({ id: MACHINE_ID, heartbeat: now });
                 if (!IS_LEADER) {
@@ -185,28 +181,24 @@ async function runLeaderElection() {
                     if (!client.isReady()) client.login(DISCORD_TOKEN);
                 }
             } 
-            // Keep being leader
             else if (currentLeader.id === MACHINE_ID) {
                 await leaderRef.update({ heartbeat: now });
                 if (!IS_LEADER) IS_LEADER = true;
             } 
-            // Step down if someone else is leader
             else {
                 if (IS_LEADER) {
                     console.log("⛔ Another leader detected. Stepping down.");
-                    process.exit(0); // Restart to clean state
+                    process.exit(0);
                 }
             }
         } catch (e) { console.error("Leader Election Error:", e); }
     }, 5000);
 }
 
-runLeaderElection(); // START SYSTEM
+runLeaderElection(); // Start system
 
-// ----------------- Discord Client Handlers -----------------
-client.on("error", (error) => console.error("⚠️ Discord Client Error (Ignored):", error.message));
-client.on("shardError", (error) => console.error("⚠️ WebSocket Error (Ignored):", error.message));
-process.on("uncaughtException", (err) => console.error("🔥 Uncaught Exception:", err));
+// ----------------- Discord Handlers -----------------
+client.on("error", (e) => console.error("Discord Error:", e.message));
 
 async function logToDiscord(message) {
   if (!IS_LEADER) return;
@@ -221,18 +213,15 @@ async function logToDiscord(message) {
 
 function denyIfWrongGuild(i) {
   if (!i.inGuild() || i.guildId !== ALLOWED_GUILD_ID) {
-    const msg = "This bot cannot be used in this server ⛔️";
-    if (!i.replied && !i.deferred) i.reply({ ephemeral: true, content: msg }).catch(() => {});
+    if (!i.replied && !i.deferred) i.reply({ ephemeral: true, content: "Wrong Server ⛔️" }).catch(()=>{});
     return true;
   }
   return false;
 }
 
-// ----------------- UI helpers -----------------
 function panelRow(isJava = false) {
   const title = isJava ? "Java AFKBot Panel 🎛️" : "Bedrock AFKBot Panel 🎛️";
   const startCustomId = isJava ? "start_java" : "start_bedrock";
-  
   return {
     content: `**${title}**`,
     components: [
@@ -250,8 +239,8 @@ function panelRow(isJava = false) {
 function adminPanelComponents() {
   const rows = [
     new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId("admin_refresh").setLabel("🔄 Refresh Stats").setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId("admin_stop_all").setLabel("🛑 Force Stop All").setStyle(ButtonStyle.Danger)
+      new ButtonBuilder().setCustomId("admin_refresh").setLabel("🔄 Refresh").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("admin_stop_all").setLabel("🛑 Stop All").setStyle(ButtonStyle.Danger)
     )
   ];
   if (sessions.size > 0) {
@@ -273,55 +262,50 @@ function getAdminStatsEmbed() {
   const memory = process.memoryUsage();
   const ramMB = (memory.rss / 1024 / 1024).toFixed(2);
   const uptime = process.uptime();
-  
   const embed = new EmbedBuilder()
     .setTitle(`🛠 Admin Panel (${MACHINE_ID})`)
     .setColor("#2f3136")
     .addFields(
-      { name: "📊 Performance", value: `**RAM:** ${ramMB} MB\n**Uptime:** ${Math.floor(uptime/60)}m`, inline: true },
-      { name: "🤖 Active Sessions", value: `**Total Bots:** ${sessions.size}`, inline: true },
+      { name: "📊 Stats", value: `**RAM:** ${ramMB} MB\n**Uptime:** ${Math.floor(uptime/60)}m`, inline: true },
+      { name: "🤖 Active", value: `**Total:** ${sessions.size}`, inline: true },
       { name: "👑 Role", value: IS_LEADER ? "Leader" : "Standby", inline: true }
     )
     .setTimestamp();
-
   if (sessions.size > 0) {
     let botList = "";
-    for (const [uid, s] of sessions) {
-      const status = s.connected ? "🟢 Online" : (s.isReconnecting ? "⏳ Reconnecting" : "🔴 Offline");
-      botList += `<@${uid}>: ${status}\n`;
-    }
-    embed.addFields({ name: "📋 Active Bot Registry", value: botList.slice(0, 1024) });
+    for (const [uid, s] of sessions) botList += `<@${uid}>: ${s.connected?"🟢":"🔴"}\n`;
+    embed.addFields({ name: "Registry", value: botList.slice(0, 1024) });
   }
   return embed;
 }
 
-// ----------------- Events: Ready & Startup Rejoin -----------------
+// ----------------- Ready Event -----------------
 client.once("ready", async () => {
-  console.log("🟢 Online as", client.user.tag);
+  console.log("🟢 Discord Ready:", client.user.tag);
 
   const cmds = [
-    new SlashCommandBuilder().setName("panel").setDescription("Open Bedrock AFK panel"),
-    new SlashCommandBuilder().setName("java").setDescription("Open Java AFKBot Panel"),
-    new SlashCommandBuilder().setName("admin").setDescription("Open Admin Control Panel")
+    new SlashCommandBuilder().setName("panel").setDescription("Bedrock Panel"),
+    new SlashCommandBuilder().setName("java").setDescription("Java Panel"),
+    new SlashCommandBuilder().setName("admin").setDescription("Admin Panel")
   ];
   await client.application.commands.set(cmds);
 
   setInterval(async () => {
     if (lastAdminMessage && IS_LEADER) {
-        try {
-            await lastAdminMessage.edit({ embeds: [getAdminStatsEmbed()], components: adminPanelComponents() });
-        } catch (e) { lastAdminMessage = null; }
+        try { await lastAdminMessage.edit({ embeds: [getAdminStatsEmbed()], components: adminPanelComponents() }); } catch (e) { lastAdminMessage = null; }
     }
   }, 30000);
 
   // Restore sessions from Firebase
-  console.log("📂 Checking Firebase 'activeSessions'...");
+  // This logic works because 'activeSessions' is persistent in Firebase.
+  // When a machine becomes leader and logs in, this triggers.
+  console.log("📂 Checking Firebase 'activeSessions' for restarts...");
   try {
       const snap = await db.ref('activeSessions').once('value');
       const savedSessions = snap.val() || {};
       const previousSessions = Object.keys(savedSessions);
       if (previousSessions.length > 0) {
-          console.log(`♻️ Found ${previousSessions.length} bots to restore.`);
+          console.log(`♻️ Restoring ${previousSessions.length} bots...`);
           let delay = 0;
           for (const uid of previousSessions) {
               setTimeout(() => startSession(uid, null, true), delay);
@@ -331,21 +315,19 @@ client.once("ready", async () => {
   } catch(e) {}
 });
 
-// ----------------- Microsoft link (MERGED LOGIC) -----------------
+// ----------------- Auth Logic -----------------
 async function linkMicrosoft(uid, interaction) {
-  if (pendingLink.has(uid)) return interaction.editReply("⏳ Login already in progress. Use the last code.");
+  if (pendingLink.has(uid)) return interaction.editReply("⏳ Login already in progress.");
   const authDir = getUserAuthDir(uid);
   
   let codeShown = false;
-
-  // Uses exactly the logic from your provided code
-  const flow = new Authflow(uid, authDir, { flow: "live", authTitle: Titles?.MinecraftNintendoSwitch || "Bedrock AFK Bot", deviceType: "Nintendo" }, async (data) => {
-      const uri = data.verification_uri_complete || data.verification_uri || "https://www.microsoft.com/link";
-      const code = data.user_code || "(no code)";
+  const flow = new Authflow(uid, authDir, { flow: "live", authTitle: "AFK Bot", deviceType: "Nintendo" }, async (data) => {
+      const uri = data.verification_uri_complete || data.verification_uri;
+      const code = data.user_code;
       lastMsa.set(uid, { uri, code, at: Date.now() });
       codeShown = true;
-      const msg = `🔐 **Microsoft Authentication Required**\n\n1. Visit: ${uri}\n2. Enter Code: \`${code}\``;
-      await interaction.editReply({ content: msg, components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setLabel("🌐 Open link").setStyle(ButtonStyle.Link).setURL(uri))] }).catch(() => {});
+      const msg = `🔐 **Auth Required**\n1. Visit: ${uri}\n2. Code: \`${code}\``;
+      try { await interaction.editReply({ content: msg, components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setLabel("Open").setStyle(ButtonStyle.Link).setURL(uri))] }); } catch(e) {}
   });
 
   const p = (async () => {
@@ -353,16 +335,16 @@ async function linkMicrosoft(uid, interaction) {
       if (!codeShown) await interaction.editReply("⏳ Requesting code…");
       await flow.getMsaToken();
       
-      let u = await getUser(uid);
+      const u = await getUser(uid);
       u.linked = true; 
       await saveUser(uid, u);
       
-      // CRITICAL: Upload the keys that Authflow just created to Firebase
+      // Sync keys to Firebase immediately after login
       await uploadAuth(uid);
 
-      await interaction.followUp({ ephemeral: true, content: "✅ Microsoft account linked! Synced to cloud." });
+      await interaction.followUp({ ephemeral: true, content: "✅ Linked & Synced!" });
     } catch (e) {
-      await interaction.editReply(`❌ Login failed: ${e.message}`).catch(() => {});
+      await interaction.editReply(`❌ Failed: ${e.message}`).catch(()=>{});
     } finally { pendingLink.delete(uid); }
   })();
   pendingLink.set(uid, p);
@@ -372,12 +354,10 @@ async function linkMicrosoft(uid, interaction) {
 function cleanupSession(uid) {
   const s = sessions.get(uid);
   if (!s) return;
-  
   if (s.reconnectTimer) clearTimeout(s.reconnectTimer);
   if (s.physicsLoop) clearInterval(s.physicsLoop);
   if (s.afkTimeout) clearTimeout(s.afkTimeout);
   if (s.chunkGCLoop) clearInterval(s.chunkGCLoop);
-
   try { s.client.close(); } catch {}
   sessions.delete(uid);
 }
@@ -396,62 +376,70 @@ function handleAutoReconnect(uid) {
     if (!s || s.manualStop) return;
     if (s.reconnectTimer) clearTimeout(s.reconnectTimer);
     s.isReconnecting = true;
-    logToDiscord(`⏳ Bot of <@${uid}> disconnected. Reconnecting in 60s...`);
+    logToDiscord(`⏳ <@${uid}> disconnected. Reconnecting in 60s...`);
     s.reconnectTimer = setTimeout(() => {
         if (sessions.has(uid) && !sessions.get(uid).manualStop) {
-             startSession(uid, null, true); 
+            startSession(uid, null, true); 
         } else cleanupSession(uid);
     }, 60000);
 }
 
-async function safeReply(interaction, content) {
+// Improved safeReply: forces components: [] if not provided, clearing old buttons
+async function safeReply(interaction, data) {
     if (!interaction) return;
+    
+    // If data is just a string, convert to object
+    if (typeof data === 'string') {
+        data = { content: data, components: [] };
+    }
+    // If components are missing in the object, force empty array to clear buttons
+    if (!data.components) {
+        data.components = [];
+    }
+
     try {
-        if (interaction.replied || interaction.deferred) await interaction.editReply(content);
-        else await interaction.reply(content);
+        if (interaction.replied || interaction.deferred) await interaction.editReply(data);
+        else await interaction.reply(data);
     } catch (e) {}
 }
 
-// ----------------- MAIN SESSION FUNCTION -----------------
 async function startSession(uid, interaction, isReconnect = false) {
-  // Fix interaction failed: Defer/Reply first
+  // Clear buttons immediately!
   if (interaction && !isReconnect) {
-      await safeReply(interaction, { content: "🔍 **Initializing...**", embeds: [] });
+      await safeReply(interaction, { content: "🔍 **Initializing...**", embeds: [], components: [] });
   }
 
   const u = await getUser(uid);
   if (!isReconnect) try { await db.ref('activeSessions/' + uid).set(true); } catch(e) {}
 
   if (!u.server) {
-      if (!isReconnect) await safeReply(interaction, "⚠ Please configure your server settings first.");
+      if (!isReconnect) await safeReply(interaction, "⚠ Set server first.");
       try { await db.ref('activeSessions/' + uid).remove(); } catch(e) {}
       return;
   }
-
   const { ip, port } = u.server;
-  if (sessions.has(uid) && !isReconnect) {
-      return safeReply(interaction, "⚠️ **Session Conflict**: Active session already exists.").catch(() => {});
-  }
+
+  if (sessions.has(uid) && !isReconnect) return safeReply(interaction, "⚠️ Session active.");
   
-  // Ensure we have Auth keys locally
+  // Download keys before connecting
   await downloadAuth(uid);
-  
-  const connectionEmbed = new EmbedBuilder().setColor("#5865F2").setTitle("Bot Initialization").setThumbnail("https://files.catbox.moe/9mqpoz.gif");
+
+  const connectionEmbed = new EmbedBuilder().setColor("#5865F2").setTitle("Bot Init").setThumbnail("https://files.catbox.moe/9mqpoz.gif");
 
   try {
       if (!isReconnect) {
-          connectionEmbed.setDescription(`🔍 **Pinging server...**\n🌐 **Target:** \`${ip}:${port}\``);
+          connectionEmbed.setDescription(`🔍 **Pinging...** \`${ip}:${port}\``);
           await safeReply(interaction, { embeds: [connectionEmbed] });
       }
       await bedrock.ping({ host: ip, port: parseInt(port) || 19132, timeout: 5000 });
       if (!isReconnect) {
-          connectionEmbed.setDescription(`✅ **Server found! Joining...**\n🌐 **Target:** \`${ip}:${port}\``);
+          connectionEmbed.setDescription(`✅ **Found! Joining...** \`${ip}:${port}\``);
           await safeReply(interaction, { embeds: [connectionEmbed] });
       }
   } catch (err) {
-      logToDiscord(`❌ Connection failure for <@${uid}>: Server ${ip}:${port} unreachable.`);
+      logToDiscord(`❌ Connect fail <@${uid}>: ${ip}:${port}`);
       if (isReconnect) handleAutoReconnect(uid); 
-      else await safeReply(interaction, { content: `❌ **Connection Failed**: Server offline.`, embeds: [] });
+      else await safeReply(interaction, { content: `❌ **Failed**: Server unreachable.`, embeds: [] });
       return; 
   }
 
@@ -460,11 +448,7 @@ async function startSession(uid, interaction, isReconnect = false) {
       host: ip, port: parseInt(port), connectTimeout: 60000, keepAlive: true, 
       viewDistance: 4, profilesFolder: authDir, username: uid, offline: false
   };
-
-  if (u.connectionType === "offline") {
-    opts.username = u.offlineUsername || `AFK_${uid.slice(-4)}`;
-    opts.offline = true;
-  }
+  if (u.connectionType === "offline") { opts.username = u.offlineUsername || `AFK_${uid.slice(-4)}`; opts.offline = true; }
 
   let mc;
   try { mc = bedrock.createClient(opts); } catch (e) { return safeReply(interaction, "❌ Client error: " + e.message); }
@@ -550,7 +534,7 @@ async function startSession(uid, interaction, isReconnect = false) {
                   if (chunk) {
                       const block = chunk.getBlock(checkPos);
                       if (block && block.name.includes('bed')) {
-                          logToDiscord(`🛌 Bed found for <@${uid}>. Attempting to sleep.`);
+                          logToDiscord(`🛌 Bed found <@${uid}>. Sleeping.`);
                           s.isTryingToSleep = true;
                           mc.write('inventory_transaction', { transaction: { transaction_type: 'item_use_on_block', action_type: 0, block_position: checkPos, block_face: 1, hotbar_slot: 0, item_in_hand: { network_id: 0 }, player_position: s.position, click_position: { x: 0, y: 0, z: 0 } } });
                           mc.write('player_action', { runtime_entity_id: s.entityId || 0n, action: 'start_sleeping', position: checkPos, result_code: 0, face: 0 });
@@ -563,7 +547,7 @@ async function startSession(uid, interaction, isReconnect = false) {
   }
 
   mc.on("spawn", () => {
-    logToDiscord(`✅ Bot of <@${uid}> spawned on **${ip}:${port}**`);
+    logToDiscord(`✅ <@${uid}> spawned on **${ip}:${port}**`);
     if (!isReconnect) safeReply(interaction, { content: `🟢 **Online** on \`${ip}:${port}\``, embeds: [] });
   });
 
@@ -588,7 +572,7 @@ async function startSession(uid, interaction, isReconnect = false) {
   });
   
   mc.on("respawn", (packet) => {
-      logToDiscord(`💀 Bot of <@${uid}> died and respawned.`);
+      logToDiscord(`💀 <@${uid}> died.`);
       if (currentSession.position) {
           currentSession.position.set(packet.position.x, packet.position.y, packet.position.z);
           currentSession.targetPosition = currentSession.position.clone();
@@ -597,11 +581,11 @@ async function startSession(uid, interaction, isReconnect = false) {
       }
   });
 
-  mc.on("error", (e) => { if (!currentSession.manualStop) handleAutoReconnect(uid); logToDiscord(`❌ Bot Error: ${e.message}`); });
-  mc.on("close", () => { if (!currentSession.manualStop) handleAutoReconnect(uid); logToDiscord(`🔌 Bot of <@${uid}> closed.`); });
+  mc.on("error", (e) => { if (!currentSession.manualStop) handleAutoReconnect(uid); });
+  mc.on("close", () => { if (!currentSession.manualStop) handleAutoReconnect(uid); logToDiscord(`🔌 <@${uid}> closed.`); });
 }
 
-// ----------------- Interactions -----------------
+// ----------------- Interaction Event -----------------
 client.on(Events.InteractionCreate, async (i) => {
   try {
     if (denyIfWrongGuild(i)) return;
@@ -611,7 +595,7 @@ client.on(Events.InteractionCreate, async (i) => {
       if (i.commandName === "panel") return safeReply(i, panelRow(false));
       if (i.commandName === "java") return safeReply(i, panelRow(true));
       if (i.commandName === "admin") {
-        if (uid !== ADMIN_ID || i.channelId !== ADMIN_CHANNEL_ID) return safeReply(i, { content: "⛔ Access restricted.", ephemeral: true });
+        if (uid !== ADMIN_ID || i.channelId !== ADMIN_CHANNEL_ID) return safeReply(i, { content: "⛔ Denied.", ephemeral: true });
         await i.deferReply();
         const msg = await i.editReply({ embeds: [getAdminStatsEmbed()], components: adminPanelComponents(), fetchReply: true });
         lastAdminMessage = msg;
@@ -621,20 +605,19 @@ client.on(Events.InteractionCreate, async (i) => {
 
     if (i.isButton()) {
       if (i.customId === "settings") {
-         // Modal cannot be deferred with deferReply/Update, must use showModal immediately
+         // No defer here, modal must show immediately
       } else {
          try {
-             // Defer everything else to prevent "Interaction Failed"
              if (i.customId === "confirm_start" || i.customId === "admin_refresh") await i.deferUpdate();
              else await i.deferReply({ ephemeral: true });
          } catch(e) {}
       }
 
       if (i.customId === "admin_refresh") return i.editReply({ embeds: [getAdminStatsEmbed()], components: adminPanelComponents() }).catch(()=>{});
-
+      
       if (i.customId === "start_bedrock") {
-        if (sessions.has(uid)) return safeReply(i, { ephemeral: true, content: "⚠️ **Session Conflict**: Active session exists." });
-        const embed = new EmbedBuilder().setTitle("Bedrock Connection").setDescription("Start bot?").setColor("#2ECC71");
+        if (sessions.has(uid)) return safeReply(i, { ephemeral: true, content: "⚠️ Active session exists." });
+        const embed = new EmbedBuilder().setTitle("Connect?").setColor("#2ECC71");
         const row = new ActionRowBuilder().addComponents(
             new ButtonBuilder().setCustomId("confirm_start").setLabel("Start").setStyle(ButtonStyle.Success),
             new ButtonBuilder().setCustomId("cancel").setLabel("Cancel").setStyle(ButtonStyle.Secondary)
@@ -643,10 +626,10 @@ client.on(Events.InteractionCreate, async (i) => {
       }
 
       if (i.customId === "start_java") {
-        if (sessions.has(uid)) return safeReply(i, { ephemeral: true, content: "⚠️ **Session Conflict**: Active session exists." });
-        const embed = new EmbedBuilder().setTitle("⚙️ Java Compatibility Check").setDescription("Req: GeyserMC + Floodgate").setColor("#E67E22");
+        if (sessions.has(uid)) return safeReply(i, { ephemeral: true, content: "⚠️ Active session exists." });
+        const embed = new EmbedBuilder().setTitle("Java Check").setDescription("Need Geyser+Floodgate").setColor("#E67E22");
         const row = new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId("confirm_start").setLabel("Confirm & Start").setStyle(ButtonStyle.Success),
+            new ButtonBuilder().setCustomId("confirm_start").setLabel("Confirm").setStyle(ButtonStyle.Success),
             new ButtonBuilder().setCustomId("cancel").setLabel("Cancel").setStyle(ButtonStyle.Secondary)
         );
         return i.editReply({ embeds: [embed], components: [row] }).catch(()=>{});
@@ -654,17 +637,15 @@ client.on(Events.InteractionCreate, async (i) => {
 
       if (i.customId === "confirm_start") return startSession(uid, i, false);
       if (i.customId === "cancel") return i.editReply({ content: "❌ Cancelled.", embeds: [], components: [] }).catch(()=>{});
-      if (i.customId === "stop") { const ok = await stopSession(uid); return safeReply(i, { ephemeral: true, content: ok ? "⏹ **Session Terminated.**" : "No active sessions." }); }
-      
+      if (i.customId === "stop") { const ok = await stopSession(uid); return safeReply(i, { ephemeral: true, content: ok ? "⏹ Stopped." : "None active." }); }
       if (i.customId === "link") return linkMicrosoft(uid, i);
-      
       if (i.customId === "unlink") { await unlinkMicrosoft(uid); return safeReply(i, { ephemeral: true, content: "🗑 Unlinked." }); }
 
       if (i.customId === "settings") {
         const u = await getUser(uid);
-        const modal = new ModalBuilder().setCustomId("settings_modal").setTitle("Configuration");
+        const modal = new ModalBuilder().setCustomId("settings_modal").setTitle("Config");
         modal.addComponents(
-          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("ip").setLabel("Server IP").setStyle(TextInputStyle.Short).setRequired(true).setValue(u.server?.ip || "")),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("ip").setLabel("IP").setStyle(TextInputStyle.Short).setRequired(true).setValue(u.server?.ip || "")),
           new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("port").setLabel("Port").setStyle(TextInputStyle.Short).setRequired(true).setValue(String(u.server?.port || 19132)))
         );
         return i.showModal(modal);
@@ -681,30 +662,18 @@ client.on(Events.InteractionCreate, async (i) => {
         return safeReply(i, { ephemeral: true, content: `✅ Saved: **${ip}:${port}**` });
     }
 
-  } catch (e) { console.error("Interaction error:", e); }
+  } catch (e) { console.error("Inter error:", e); }
 });
 
-// New Message Listener (Afkbot reaction)
 client.on(Events.MessageCreate, async (message) => {
-    if (message.author.bot) return;
-    if (message.channel.id !== '1462398161074000143') return;
-    if (!IS_LEADER) return; // Only the active bot replies
-
+    if (message.author.bot || message.channel.id !== '1462398161074000143' || !IS_LEADER) return;
     const content = message.content.toLowerCase();
-    const triggerWords = ['afk', 'afkbot'];
-
-    if (triggerWords.some(word => content.includes(word))) {
+    if (['afk', 'afkbot'].some(word => content.includes(word))) {
         try {
             const reaction = await message.react('<a:loading:1470137639339299053>');
-            setTimeout(async () => {
-                try {
-                    await reaction.remove();
-                    await message.reply("What bout me? 😁");
-                } catch (e) {}
-            }, 3000);
-        } catch (e) { console.error(e.message); }
+            setTimeout(async () => { try { await reaction.remove(); await message.reply("What bout me? 😁"); } catch (e) {} }, 3000);
+        } catch (e) {}
     }
 });
 
-process.on("unhandledRejection", (e) => console.error("Unhandled Rejection:", e));
-// Login handled in runLeaderElection()
+process.on("unhandledRejection", (e) => console.error("Unhandled:", e));
