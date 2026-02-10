@@ -10,11 +10,11 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-# Copy package.json first to cache dependencies
+# Copy package.json first
 COPY package.json .
 
-# Install dependencies
-RUN npm install
+# Clear npm cache and install dependencies
+RUN npm cache clean --force && npm install
 
 # Copy the rest of the application code
 COPY . .
