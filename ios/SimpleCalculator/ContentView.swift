@@ -7,12 +7,22 @@ struct ContentView: View {
 
     var body: some View {
         ZStack {
-            LinearGradient(
-                colors: [Color(red: 0.12, green: 0.14, blue: 0.26), Color(red: 0.04, green: 0.04, blue: 0.08)],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
-            )
-            .ignoresSafeArea()
+            Color.black
+                .opacity(0.94)
+                .ignoresSafeArea()
+
+            // iOS 26-inspired liquid glass blobs (no gradients).
+            Circle()
+                .fill(.white.opacity(0.08))
+                .frame(width: 340, height: 340)
+                .blur(radius: 60)
+                .offset(x: -130, y: -260)
+
+            Circle()
+                .fill(.cyan.opacity(0.10))
+                .frame(width: 320, height: 320)
+                .blur(radius: 70)
+                .offset(x: 180, y: 280)
 
             VStack(spacing: 16) {
                 header
@@ -28,7 +38,11 @@ struct ContentView: View {
         VStack(alignment: .leading, spacing: 8) {
             Text("Simple Calculator")
                 .font(.title2.bold())
-                .foregroundStyle(.white.opacity(0.95))
+                .foregroundStyle(.white.opacity(0.96))
+
+            Text("iOS 26 Liquid Glass")
+                .font(.caption.weight(.medium))
+                .foregroundStyle(.white.opacity(0.55))
 
             if !viewModel.history.isEmpty {
                 ScrollView(.horizontal, showsIndicators: false) {
@@ -38,7 +52,11 @@ struct ContentView: View {
                                 .font(.caption)
                                 .padding(.horizontal, 12)
                                 .padding(.vertical, 8)
-                                .background(.white.opacity(0.12), in: Capsule())
+                                .background(.ultraThinMaterial, in: Capsule())
+                                .overlay(
+                                    Capsule()
+                                        .stroke(.white.opacity(0.14), lineWidth: 0.9)
+                                )
                         }
                     }
                 }
@@ -51,7 +69,7 @@ struct ContentView: View {
         VStack(alignment: .trailing, spacing: 8) {
             Text(viewModel.expressionText)
                 .font(.headline)
-                .foregroundStyle(.white.opacity(0.75))
+                .foregroundStyle(.white.opacity(0.74))
                 .lineLimit(1)
                 .frame(maxWidth: .infinity, alignment: .trailing)
 
@@ -63,11 +81,12 @@ struct ContentView: View {
                 .frame(maxWidth: .infinity, alignment: .trailing)
         }
         .padding(18)
-        .background(.ultraThinMaterial.opacity(0.8), in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 26, style: .continuous))
         .overlay(
-            RoundedRectangle(cornerRadius: 24, style: .continuous)
-                .stroke(.white.opacity(0.08), lineWidth: 1)
+            RoundedRectangle(cornerRadius: 26, style: .continuous)
+                .stroke(.white.opacity(0.16), lineWidth: 1)
         )
+        .shadow(color: .black.opacity(0.28), radius: 16, x: 0, y: 8)
     }
 
     private var keypad: some View {
@@ -113,42 +132,38 @@ private struct CalculatorButtonStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .foregroundStyle(foregroundColor)
-            .background(background(configuration.isPressed), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+            .background(
+                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    .fill(.ultraThinMaterial)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 18, style: .continuous)
+                            .fill(tintColor.opacity(configuration.isPressed ? 0.32 : 0.22))
+                    )
+            )
             .overlay(
                 RoundedRectangle(cornerRadius: 18, style: .continuous)
-                    .stroke(.white.opacity(configuration.isPressed ? 0.22 : 0.1), lineWidth: 1)
+                    .stroke(.white.opacity(configuration.isPressed ? 0.28 : 0.14), lineWidth: 1)
             )
+            .shadow(color: .black.opacity(configuration.isPressed ? 0.10 : 0.22), radius: configuration.isPressed ? 4 : 8, x: 0, y: configuration.isPressed ? 2 : 4)
             .scaleEffect(configuration.isPressed ? 0.97 : 1)
             .animation(.spring(response: 0.22, dampingFraction: 0.74), value: configuration.isPressed)
     }
 
     private var foregroundColor: Color {
-        switch role {
-        case .utility:
-            return .white.opacity(0.95)
-        default:
-            return .white
-        }
+        .white
     }
 
-    private func background(_ pressed: Bool) -> LinearGradient {
-        let colors: [Color]
+    private var tintColor: Color {
         switch role {
         case .number:
-            colors = [Color.white.opacity(0.20), Color.white.opacity(0.08)]
+            return .white
         case .utility:
-            colors = [Color(red: 0.35, green: 0.35, blue: 0.45), Color(red: 0.22, green: 0.22, blue: 0.30)]
+            return Color(red: 0.70, green: 0.76, blue: 0.90)
         case .operation:
-            colors = [Color(red: 0.61, green: 0.45, blue: 0.98), Color(red: 0.36, green: 0.22, blue: 0.86)]
+            return Color(red: 0.62, green: 0.68, blue: 0.98)
         case .equals:
-            colors = [Color(red: 0.17, green: 0.74, blue: 0.67), Color(red: 0.06, green: 0.53, blue: 0.56)]
+            return Color(red: 0.46, green: 0.86, blue: 0.80)
         }
-
-        return LinearGradient(
-            colors: pressed ? colors.map { $0.opacity(0.75) } : colors,
-            startPoint: .topLeading,
-            endPoint: .bottomTrailing
-        )
     }
 }
 
