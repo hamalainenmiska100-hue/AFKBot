@@ -1,0 +1,59 @@
+name: Build unsigned iOS IPA
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "ios/**"
+      - ".github/workflows/ios_unsigned_ipa.yml"
+  pull_request:
+    paths:
+      - "ios/**"
+      - ".github/workflows/ios_unsigned_ipa.yml"
+
+jobs:
+  build-unsigned-ipa:
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: |
+          cd ios
+          xcodegen generate
+
+      - name: Build app for iphoneos (without signing)
+        run: |
+          xcodebuild \
+            -project ios/SimpleCalculator.xcodeproj \
+            -scheme SimpleCalculator \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath ios/build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: Package unsigned IPA
+        run: |
+          APP_PATH=$(find ios/build/Build/Products/Release-iphoneos -maxdepth 1 -name "*.app" | head -n 1)
+          if [ -z "$APP_PATH" ]; then
+            echo "App bundle not found"
+            exit 1
+          fi
+
+          mkdir -p ios/output/Payload
+          cp -R "$APP_PATH" ios/output/Payload/
+          (cd ios/output && zip -r SimpleCalculator-unsigned.ipa Payload)
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SimpleCalculator-unsigned-ipa
+          path: ios/output/SimpleCalculator-unsigned.ipa
