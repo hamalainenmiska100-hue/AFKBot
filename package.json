@@ -9,6 +9,7 @@
     "bedrock-protocol": "latest",
     "discord.js": "^14.11.0",
     "firebase-admin": "^11.11.0",
+    "minecraft-protocol": "^1.62.0",
     "minecraft-data": "latest",
     "prismarine-auth": "latest",
     "prismarine-chunk": "latest",
