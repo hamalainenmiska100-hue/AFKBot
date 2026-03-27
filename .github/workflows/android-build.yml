@@ -1,11 +1,15 @@
 name: Android Build
 
 on:
-  push:
-    branches:
-      - main
-  pull_request:
   workflow_dispatch:
+  push:
+    paths:
+      - "android/**"
+      - ".github/workflows/android-build.yml"
+  pull_request:
+    paths:
+      - "android/**"
+      - ".github/workflows/android-build.yml"
 
 jobs:
   build-android:
@@ -15,13 +19,30 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Detect Android project
+        id: detect_android
+        run: |
+          if [ -f "android/gradlew" ] && [ -f "android/settings.gradle" -o -f "android/settings.gradle.kts" ]; then
+            echo "has_android=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_android=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Fail if Android project is missing
+        if: steps.detect_android.outputs.has_android != 'true'
+        run: |
+          echo "Android project not found. Expected android/gradlew and android/settings.gradle(.kts)."
+          exit 1
+
       - name: Set up Node.js
+        if: steps.detect_android.outputs.has_android == 'true'
         uses: actions/setup-node@v4
         with:
           node-version: '22'
           cache: npm
 
       - name: Install Java
+        if: steps.detect_android.outputs.has_android == 'true'
         uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -29,11 +50,22 @@ jobs:
           cache: gradle
 
       - name: Install dependencies
+        if: steps.detect_android.outputs.has_android == 'true'
         run: npm ci
 
       - name: Make Gradle wrapper executable
+        if: steps.detect_android.outputs.has_android == 'true'
         run: chmod +x android/gradlew
 
       - name: Build Android release APK
+        if: steps.detect_android.outputs.has_android == 'true'
         working-directory: android
         run: ./gradlew assembleRelease
+
+      - name: Upload APK artifact
+        if: steps.detect_android.outputs.has_android == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-release-apk
+          path: android/app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
