@@ -4,10 +4,10 @@ AFKBot is a Discord bot that connects to a Minecraft server on your behalf, allo
 
 ## Requirements
 
-- Node.js (v16.6.0 or higher)
+- Node.js (v22.0.0 or higher)
 - Discord Bot Token
-- Own discord server (for logging)
-- Mineflayer (A Minecraft bot API)
+- Own Discord server (for interaction panel)
+- Microsoft account for Bedrock authentication flow
 
 ## Installation
 
@@ -20,13 +20,16 @@ AFKBot is a Discord bot that connects to a Minecraft server on your behalf, allo
     
 2. **Configure your bot**
 
-    Replace `TOKEN` in the code with your Discord bot token.
-    Replace `LOG_CHANNEL` with the ID of the Discord channel where you want to log bot activities.
+    Set your bot token as an environment variable before running:
+
+    ```bash
+    export DISCORD_TOKEN=your_discord_bot_token
+    ```
 
 3. **Install dependencies**
     
     ```bash
-    npm install discord.js mineflayer
+    npm install
     ```
 
 4. **Run**
