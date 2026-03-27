@@ -14,6 +14,7 @@ targets:
       - path: SimpleCalculator
     settings:
       base:
+        GENERATE_INFOPLIST_FILE: YES
         INFOPLIST_KEY_CFBundleDisplayName: SimpleCalculator
         INFOPLIST_KEY_LSRequiresIPhoneOS: true
         INFOPLIST_KEY_UIApplicationSceneManifest_Generation: true
